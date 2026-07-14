@@ -22,9 +22,11 @@ pip install -r requirements.txt
 python splice.py
 ```
 
-**Output location** — shown in the bar near the top of the window. Click it any time
-to change where files get saved; it's remembered between runs (defaults to
-`~/Documents/Splice`).
+**Output location** — Splice has no default output folder. On every launch it opens
+a folder picker asking where to save output (starting from your last choice, but you
+confirm each time); canceling re-prompts, since the app can't run without a location.
+Once chosen, it's also shown in the bar near the top of the window — click it any time
+during the session to change where files get saved.
 
 **Merge module** — drop two or more mp3 parts of the same audiobook (in order, or
 drag within the list to reorder), then click MERGE. Produces a single
