@@ -36,7 +36,6 @@ FFMPEG_INSTALL_HINT = (
     "Windows: winget install ffmpeg  (or choco install ffmpeg / scoop install ffmpeg)\n\n"
     "Then restart this app."
 )
-DEFAULT_OUTPUT_DIR = str(Path.home() / "Documents" / "Splice")
 
 # --- "Odyssey" retro-futurism palette — warm, rounded, analog-console feel ---
 # (deliberately distinct from the wiki's Field Dossier brand colors)
@@ -411,13 +410,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("Thomas", "Splice")
-        self.output_dir = self.settings.value("output_dir", DEFAULT_OUTPUT_DIR)
-        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        self.output_dir = None
 
         self.setWindowTitle("Splice")
         self.resize(620, 760)
         self._build_ui()
-        QTimer.singleShot(200, self._check_ffmpeg)
+        QTimer.singleShot(200, self._startup)
 
     # ---- UI construction ----
 
@@ -466,7 +464,10 @@ class MainWindow(QMainWindow):
         return row
 
     def _refresh_output_label(self):
-        self.output_btn.setText(f"OUTPUT ▸  {self.output_dir}   (click to change)")
+        if self.output_dir:
+            self.output_btn.setText(f"OUTPUT ▸  {self.output_dir}   (click to change)")
+        else:
+            self.output_btn.setText("OUTPUT ▸  (no folder chosen yet)   (click to change)")
 
     def _build_merge_panel(self):
         frame, layout = panel("MERGE MODULE — combine multi-part audiobooks")
@@ -554,19 +555,44 @@ class MainWindow(QMainWindow):
         self.status_label.setText(text)
 
     def _choose_output_dir(self):
-        chosen = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_dir)
+        start_dir = self.output_dir or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Choose output folder", start_dir)
         if chosen:
             self.output_dir = chosen
             self.settings.setValue("output_dir", chosen)
             self._refresh_output_label()
 
     def _open_output_dir(self):
+        if not self.output_dir:
+            return
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_dir))
 
     def _check_ffmpeg(self):
         if not shutil.which(FFMPEG):
             QMessageBox.critical(self, "ffmpeg not found", FFMPEG_INSTALL_HINT)
+
+    def _startup(self):
+        self._check_ffmpeg()
+        self.output_dir = self._prompt_for_output_dir()
+        self._refresh_output_label()
+
+    def _prompt_for_output_dir(self) -> str:
+        start_dir = self.settings.value("output_dir", str(Path.home()))
+        while True:
+            chosen = QFileDialog.getExistingDirectory(self, "Choose output folder for Splice", start_dir)
+            if chosen:
+                self.settings.setValue("output_dir", chosen)
+                return chosen
+            reply = QMessageBox.question(
+                self,
+                "No folder chosen",
+                "Splice needs an output folder to continue. Choose one now?",
+                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close,
+                QMessageBox.StandardButton.Retry,
+            )
+            if reply == QMessageBox.StandardButton.Close:
+                sys.exit(0)
 
     def _move_selected(self, delta: int):
         row = self.merge_list.currentRow()
@@ -592,6 +618,9 @@ class MainWindow(QMainWindow):
             self._set_status("standby", "STANDBY")
 
     def _run_merge(self):
+        if not self.output_dir:
+            self.output_dir = self._prompt_for_output_dir()
+            self._refresh_output_label()
         files = self.merge_list.paths()
         if len(files) < 2:
             QMessageBox.warning(self, "Need at least 2 files", "Add two or more mp3 parts to merge.")
@@ -613,6 +642,9 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
 
     def _run_split(self, files: list[str]):
+        if not self.output_dir:
+            self.output_dir = self._prompt_for_output_dir()
+            self._refresh_output_label()
         segment_seconds = int(self.minutes_spin.value() * 60)
         self._set_busy(True)
         self.split_worker = SplitWorker(files, self.output_dir, segment_seconds)
