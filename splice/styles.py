@@ -174,4 +174,52 @@ QLabel#coverArt {{
     background-color: {CONSOLE};
     color: {MUTED};
 }}
+QWidget#sidebar {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+}}
+QLabel#sidebarSection {{
+    color: {MUTED};
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    padding: 8px 10px 2px 10px;
+}}
+QPushButton#sidebarNav {{
+    background-color: transparent;
+    color: {INK};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    text-align: left;
+    padding: 8px 10px;
+    letter-spacing: 1px;
+}}
+QPushButton#sidebarNav:hover {{
+    background-color: {BG};
+    color: {ORANGE};
+}}
+QPushButton#sidebarNav:checked {{
+    background-color: {BG};
+    color: {ORANGE};
+    font-weight: bold;
+    border-left: 3px solid {ORANGE};
+}}
+QListWidget#sidebarList {{
+    background-color: transparent;
+    border: none;
+    color: {INK};
+    outline: none;
+}}
+QListWidget#sidebarList::item {{
+    padding: 6px 10px;
+    border-radius: {RADIUS_SM}px;
+}}
+QListWidget#sidebarList::item:hover {{
+    color: {ORANGE};
+}}
+QListWidget#sidebarList::item:selected {{
+    background-color: {BG};
+    color: {ORANGE};
+}}
 """

@@ -1,10 +1,14 @@
 # Splice
 
-A PyQt6 desktop app for merging and splitting mp3 audiobooks — merge multi-part
-files into one, then split into fixed-length segments (`0.mp3`, `1.mp3`, `2.mp3`, ...)
-for devices like the Shokz OpenSwim Pro. Also downloads audio straight from YouTube
-and edits ID3 tags (title, artist, album, year, track number, cover art) for getting
-music and audiobooks properly labeled on devices like an iPod Classic.
+A PyQt6 desktop app for organizing and prepping mp3 music and audiobooks. At its
+core is a **Library**: a deduplicated, one-file-per-track collection (`Music/` by
+Artist/Album, `Audiobooks/` preserving your existing series-folder structure)
+built non-destructively from your existing folders, with hand-curated playlists
+(`.m3u8`) referencing into it instead of each playlist being its own set of
+duplicate copies. Alongside that, four tools handle the rest of the pipeline:
+merging multi-part audiobooks, splitting into fixed-length segments (`0.mp3`,
+`1.mp3`, ... — bookmarks for devices like the Shokz OpenSwim Pro that can't
+seek/resume), downloading straight from YouTube, and editing ID3 tags.
 
 ## Setup
 
@@ -30,9 +34,48 @@ python splice.py
 
 - `splice/styles.py` — palette constants and the app-wide Qt stylesheet
 - `splice/widgets.py` — reusable widgets (drop zones, file pickers, the level gauge, cover art thumbnail)
+- `splice/sidebar.py` — the left-hand navigation (Library/Search, Playlists, Tools)
 - `splice/workers.py` — background `QThread` workers that shell out to ffmpeg/ffprobe/yt-dlp
 - `splice/tagging.py` — `mutagen`-based ID3 read/write helpers (no Qt dependency)
-- `splice/main_window.py` — the main window: tab wiring and all UI behavior
+- `splice/library_view.py` — the Library home view and the ADD SOURCES migration wizard
+- `splice/library/` — the library backend: `db.py` (SQLite index), `scanner.py` (read-only tag/duration/hash reads), `naming.py` (destination paths), `playlists.py` (`.m3u8` read/write), `migrate.py` (scan/build `QThread` workers)
+- `splice/main_window.py` — the main window: sidebar/page wiring and the Merge/Split/YouTube/Tags tool behavior
+
+## Library
+
+The app opens on the Library view. It starts empty — click **ADD SOURCES...** to
+build it from folders you already have:
+
+1. **Add music playlist folders** — one per existing playlist folder (monthly,
+   themed, whatever). Mark exactly **one** as your master collection (e.g. a
+   "Liked" folder that already contains everything) — tracks from that folder are
+   filed into the library but don't get a playlist entry, since the whole library
+   *is* that collection. Double-click a folder's name in the list to rename it;
+   that's the playlist name it becomes.
+2. Optionally **set an audiobooks folder** — its existing structure (standalone
+   files, or `Series Name/1_book_one.mp3`-style folders) is preserved exactly,
+   no renaming.
+3. Click **SCAN** — read-only, hashes and reads tags for a preview (new tracks,
+   exact duplicates, fuzzy matches, files landing in Unsorted) without writing
+   anything. Safe to run as many times as you like.
+4. Click **BUILD LIBRARY** — copies files into `Library/Music/<Artist>/<Album>/`
+   or `Library/Audiobooks/...` and writes `.m3u8` playlists. Your original
+   folders are never modified or deleted. Re-runnable later as your collection
+   grows — already-migrated files (matched by content hash) are never re-copied.
+
+Duplicate handling is conservative on purpose: exact byte-identical files are
+auto-deduplicated (only one copy is ever kept), but anything less certain — same
+title/artist with different underlying bytes — is left as two separate tracks and
+flagged in the **Duplicates** tab for you to review; nothing is ever auto-merged.
+Tracks with missing or unusable title/artist/album tags land in **Unsorted**
+instead of a guessed folder — select one and click **FIX TAGS** to jump straight
+to the Tags tool with it loaded.
+
+The **Songs** and **Audiobooks** tabs are a searchable, sortable table (search
+box up top filters by title/artist/album). The **In** column shows how many
+playlists a track belongs to. Playlists built by a migration appear in the
+sidebar — click one to see its contents (read-only for now; a full playlist
+editor is planned).
 
 **Output location** — Splice has no default output folder. On every launch it opens
 a folder picker asking where to save output (starting from your last choice, but you
@@ -61,7 +104,7 @@ file name (pre-filled with `<first file>_merged`, editable or replaceable
 entirely); confirm to merge, or cancel to back out. Uses a fast stream copy; if
 the source files don't share the same format it automatically retries with a
 re-encode. Check "Then split into segments" before merging to automatically chop
-the merged result using the Split tab's current segment length — no manual
+the merged result using the Split tool's current segment length — no manual
 hand-off needed.
 
 **Split module** — set the segment length in minutes (defaults to 2), then drop
@@ -81,7 +124,7 @@ their individual videos automatically. Everything downloads and converts to mp3
 (via `yt-dlp` + ffmpeg) straight into the output folder, one at a time, from a
 visible queue — you can keep pasting more (including while something's already
 downloading) and it just joins the back of the line. Already-queued or
-currently-downloading duplicates are skipped automatically. The YouTube tab runs
+currently-downloading duplicates are skipped automatically. The YouTube tool runs
 fully independently of Merge/Split/Tags — none of them block each other. This only
 downloads — drag the result onto the Split zone yourself if you want it chunked.
 

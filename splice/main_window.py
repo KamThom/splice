@@ -27,12 +27,16 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from . import tagging
+from .library import db as libdb
+from .library_view import LibraryView, PlaylistView
+from .sidebar import Sidebar
 from .styles import STYLESHEET
 from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, SplitDropZone, StatusDot
 from .workers import (
@@ -63,8 +67,9 @@ def panel(title: str) -> tuple[QFrame, QVBoxLayout]:
 
 
 def tab_content(title: str) -> tuple[QWidget, QVBoxLayout]:
-    """Borderless content container for a tab page — QTabWidget::pane already
-    supplies the surrounding border, so a nested panel() frame here would double it up."""
+    """Borderless content container for a sidebar-navigated page — the surrounding
+    content frame in _build_ui already supplies the border, so a nested panel()
+    frame here would double it up."""
     widget = QWidget()
     layout = QVBoxLayout(widget)
     layout.setContentsMargins(14, 12, 14, 14)
@@ -91,6 +96,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings("Thomas", "Splice")
         self.output_dir = None
+        self.library_root = str(self.settings.value("library_root", "") or "") or None
+        self._pending_library_refile = None
         self.active_worker = None
         self.active_kind = None
         self._batch_tag_cancel_requested = False
@@ -101,7 +108,7 @@ class MainWindow(QMainWindow):
         self._current_download_title = None
 
         self.setWindowTitle("Splice")
-        self.resize(640, 840)
+        self.resize(900, 840)
         self._build_ui()
         self._load_persisted_batch_tag_defaults()
         self._load_persisted_youtube_quality()
@@ -119,15 +126,89 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(self._build_header())
         layout.addLayout(self._build_output_bar())
+        layout.addLayout(self._build_body(), stretch=1)
+        layout.addWidget(self._build_console())
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_merge_panel(), "MERGE")
-        self.tabs.addTab(self._build_split_panel(), "SPLIT")
-        self.tabs.addTab(self._build_youtube_panel(), "YOUTUBE")
-        self.tabs.addTab(self._build_metadata_panel(), "TAGS")
-        layout.addWidget(self.tabs)
+    def _build_body(self):
+        row = QHBoxLayout()
+        row.setSpacing(14)
 
-        layout.addWidget(self._build_console(), stretch=1)
+        self.sidebar = Sidebar()
+        self.sidebar.navigate.connect(self._on_navigate)
+        row.addWidget(self.sidebar)
+
+        content_frame = QFrame()
+        content_frame.setObjectName("panel")
+        content_layout = QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.content_stack = QStackedWidget()
+        self.page_library = LibraryView(self._get_library_root, self._set_library_root)
+        self.page_library.fixTagsRequested.connect(self._fix_tags_for_path)
+        self.page_library.libraryChanged.connect(self._refresh_sidebar_playlists)
+        self.page_library.libraryLocationChanged.connect(
+            lambda path: self._write_log(f"[{ts()}] Library location set to: {path}")
+        )
+        self.page_playlist = PlaylistView(self._get_library_root)
+        self.page_merge = self._build_merge_panel()
+        self.page_split = self._build_split_panel()
+        self.page_youtube = self._build_youtube_panel()
+        self.page_tags = self._build_metadata_panel()
+        pages = (self.page_library, self.page_playlist, self.page_merge,
+                 self.page_split, self.page_youtube, self.page_tags)
+        for page in pages:
+            self.content_stack.addWidget(page)
+        content_layout.addWidget(self.content_stack)
+        row.addWidget(content_frame, stretch=1)
+
+        self.sidebar.select("library")
+        self._refresh_sidebar_playlists()
+        return row
+
+    def _get_library_root(self) -> str | None:
+        return self.library_root
+
+    def _set_library_root(self, path: str):
+        self.library_root = path
+        self.settings.setValue("library_root", path)
+
+    def _refresh_sidebar_playlists(self):
+        if not self.library_root or not Path(self.library_root).exists():
+            self.sidebar.set_playlists([])
+            return
+        conn = libdb.open_db(self.library_root)
+        playlists = [(p["id"], p["name"]) for p in libdb.list_playlists(conn)]
+        conn.close()
+        self.sidebar.set_playlists(playlists)
+
+    def _fix_tags_for_path(self, path: str, track_id: int):
+        self.sidebar.select("tags")
+        self._load_tag_file_from_path(path)
+        # Loading always clears this; set it after, so saving knows to re-file
+        # the track back into the library instead of just rewriting its ID3 tags.
+        self._pending_library_refile = track_id
+
+    def _on_navigate(self, kind: str, payload):
+        if kind == "playlist":
+            playlist_id, name = payload
+            self.page_playlist.show_playlist(playlist_id, name)
+            self.content_stack.setCurrentWidget(self.page_playlist)
+            return
+
+        pages = {
+            "library": self.page_library,
+            "merge": self.page_merge,
+            "split": self.page_split,
+            "youtube": self.page_youtube,
+            "tags": self.page_tags,
+        }
+        if kind == "search":
+            self.content_stack.setCurrentWidget(self.page_library)
+            self.page_library.search_edit.setFocus()
+            return
+        page = pages.get(kind)
+        if page is not None:
+            self.content_stack.setCurrentWidget(page)
 
     def _build_header(self):
         row = QVBoxLayout()
@@ -503,25 +584,20 @@ class MainWindow(QMainWindow):
 
     def _startup(self):
         self._check_ffmpeg()
-        self.output_dir = self._prompt_for_output_dir()
-        self._refresh_output_label()
+        # No eager output-folder prompt here — Merge/Split/YouTube each prompt
+        # lazily, only when actually needed, via _prompt_for_output_dir below.
 
-    def _prompt_for_output_dir(self) -> str:
+    def _prompt_for_output_dir(self) -> str | None:
+        """Cancel-friendly: returns None if the user backs out instead of forcing
+        a choice. Callers must handle None by aborting the action that needed it —
+        this is only ever called lazily, not at startup, so there's nothing to
+        force the user into."""
         start_dir = self.settings.value("output_dir", str(Path.home()))
-        while True:
-            chosen = QFileDialog.getExistingDirectory(self, "Choose output folder for Splice", start_dir)
-            if chosen:
-                self.settings.setValue("output_dir", chosen)
-                return chosen
-            reply = QMessageBox.question(
-                self,
-                "No folder chosen",
-                "Splice needs an output folder to continue. Choose one now?",
-                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close,
-                QMessageBox.StandardButton.Retry,
-            )
-            if reply == QMessageBox.StandardButton.Close:
-                sys.exit(0)
+        chosen = QFileDialog.getExistingDirectory(self, "Choose output folder", start_dir)
+        if not chosen:
+            return None
+        self.settings.setValue("output_dir", chosen)
+        return chosen
 
     def _set_busy(self, busy: bool, kind: str | None = None):
         # Merge/Split/batch-tag remain mutually exclusive with each other, one
@@ -567,6 +643,8 @@ class MainWindow(QMainWindow):
         if not self.output_dir:
             self.output_dir = self._prompt_for_output_dir()
             self._refresh_output_label()
+            if not self.output_dir:
+                return
         files = self.merge_list.paths()
         if len(files) < 2:
             QMessageBox.warning(self, "Need at least 2 files", "Add two or more mp3 parts to merge.")
@@ -596,7 +674,7 @@ class MainWindow(QMainWindow):
         self.merge_list.clear()
 
         if self.merge_then_split_check.isChecked():
-            self.tabs.setCurrentIndex(1)  # SPLIT tab
+            self.sidebar.select("split")
             self._run_split([out_path])
 
     def _on_merge_err(self, err: str):
@@ -615,6 +693,8 @@ class MainWindow(QMainWindow):
         if not self.output_dir:
             self.output_dir = self._prompt_for_output_dir()
             self._refresh_output_label()
+            if not self.output_dir:
+                return
         segment_seconds = int(self.minutes_spin.value() * 60)
 
         self._split_estimates = []
@@ -668,7 +748,7 @@ class MainWindow(QMainWindow):
         if not self._last_split_segments:
             return
         self.batch_tag_list.add_paths(self._last_split_segments)
-        self.tabs.setCurrentIndex(3)  # TAGS tab
+        self.sidebar.select("tags")
         self.tag_mode_tabs.setCurrentIndex(1)  # BATCH APPLY sub-tab
         self._write_log(f"[{ts()}] Sent {len(self._last_split_segments)} segment(s) to Tags -> Batch Apply.")
 
@@ -687,6 +767,8 @@ class MainWindow(QMainWindow):
         if not self.output_dir:
             self.output_dir = self._prompt_for_output_dir()
             self._refresh_output_label()
+            if not self.output_dir:
+                return
 
         urls = [line.strip() for line in text.splitlines() if line.strip()]
         self.youtube_url_edit.clear()
@@ -868,6 +950,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Load mp3", self.output_dir or str(Path.home()), "MP3 files (*.mp3)")
         if not path:
             return
+        self._load_tag_file_from_path(path)
+
+    def _load_tag_file_from_path(self, path: str):
+        """Populates the single-file tag editor from a known path — shared by the
+        LOAD MP3 file dialog and the Library view's "Fix Tags" shortcut."""
+        self._pending_library_refile = None  # loading any file clears a stale pending refile
         self.single_tag_path = path
         self.single_tag_path_label.setText(Path(path).name)
         self.single_tag_path_label.setObjectName("")
@@ -909,6 +997,28 @@ class MainWindow(QMainWindow):
             return
         self._write_log(f"[{ts()}] Tags saved -> {Path(self.single_tag_path).name}")
         self._set_status("done", "TAGS SAVED")
+
+        if self._pending_library_refile is not None:
+            track_id = self._pending_library_refile
+            self._pending_library_refile = None
+            self._refile_library_track(track_id)
+
+    def _refile_library_track(self, track_id: int):
+        """After saving tags for a file that came from the Library's Unsorted
+        tab, re-file it into its correct Artist/Album folder and refresh the
+        index — otherwise it'd keep showing as Unsorted forever, since editing
+        ID3 tags alone doesn't move the file or update the database."""
+        if not self.library_root:
+            return
+        from .library.migrate import refile_track
+        try:
+            moved = refile_track(self.library_root, track_id)
+        except Exception as e:
+            self._write_log(f"[{ts()}] Could not re-file library track: {e}")
+            return
+        if moved:
+            self._write_log(f"[{ts()}] Re-filed into the library.")
+        self.page_library.refresh()
 
     # ---- tagging behavior: batch ----
 

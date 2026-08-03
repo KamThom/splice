@@ -35,11 +35,25 @@ def escape_concat_path(path: str) -> str:
 
 
 INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+RESERVED_WINDOWS_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def sanitize_filename(name: str) -> str:
     name = INVALID_FILENAME_CHARS.sub("", name).strip()
-    return name or "merged"
+    name = name.rstrip(" .")  # Windows disallows trailing dots/spaces on file/folder names —
+    # mkdir()/copy2() silently normalize these away, which then leaves the path
+    # Python still thinks it wrote to pointing at a name that doesn't actually
+    # exist on disk (the likely cause of an intermittent "path not found" copy
+    # failure on tag values ending in a period, e.g. an abbreviation like "Vol. 1.").
+    if not name:
+        return "merged"
+    if name.upper() in RESERVED_WINDOWS_NAMES:
+        name = f"_{name}"
+    return name
 
 
 def ts() -> str:
