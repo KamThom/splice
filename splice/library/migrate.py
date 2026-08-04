@@ -106,6 +106,48 @@ def refile_track(library_root: str, track_id: int) -> bool:
         conn.close()
 
 
+def file_single_track(library_root: str, source_path: str, kind: str = "music") -> tuple[int | None, str]:
+    """Reads, dedup-checks by hash, copies into Library/Music (or
+    Library/Audiobooks), and indexes one already-known file. Returns
+    (track_id, status) — status is "added", "already_in_library", or a
+    human-readable reason the file couldn't be filed. Standalone, not tied to
+    a QThread — used for filing a single fresh YouTube download straight into
+    the library instead of requiring a full re-scan of its output folder."""
+    scanned, reason = read_scan_info(source_path)
+    if scanned is None:
+        return None, reason
+
+    conn = libdb.open_db(library_root)
+    try:
+        existing = libdb.find_by_hash(conn, scanned.hash)
+        if existing is not None:
+            return existing["id"], "already_in_library"
+
+        if kind == "music":
+            dest_rel = Path("Music") / naming.music_destination(scanned)
+        else:
+            dest_rel = Path("Audiobooks") / Path(source_path).name
+
+        dest_abs = unique_path(Path(library_root) / dest_rel)
+        dest_abs.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, dest_abs)
+        library_path = dest_abs.relative_to(library_root).as_posix()
+
+        track_id = libdb.insert_track(
+            conn, file_hash=scanned.hash, library_path=library_path, kind=kind,
+            title=scanned.title, artist=scanned.artist, album=scanned.album,
+            date=scanned.date, tracknumber=scanned.tracknumber,
+            duration_seconds=scanned.duration_seconds,
+        )
+        if kind == "music":
+            fuzzy_matches = libdb.find_by_normalized_title_artist(conn, scanned.title, scanned.artist)
+            for match in fuzzy_matches:
+                libdb.add_fuzzy_dupe(conn, track_id, match["id"], "same normalized title+artist")
+        return track_id, "added"
+    finally:
+        conn.close()
+
+
 class LibraryScanWorker(QThread):
     """Read-only: hashes + reads tags for every file across all sources against
     the existing index, and reports what a build would do. Writes nothing —

@@ -4,6 +4,7 @@
 # (deliberately distinct from the wiki's Field Dossier brand colors)
 BG = "#43403A"          # warm taupe chassis, lighter than a typical dark theme
 SURFACE = "#57534B"      # panel surface, one step up from chassis
+RAIL_SURFACE = "#69655D"  # tool rail — a step lighter than SURFACE so it reads clearly against the chassis
 CONSOLE = "#2B2924"      # CRT-readout well — stays dark on purpose for phosphor contrast
 INK = "#F6EFDD"          # warm cream text
 MUTED = "#C9C0AC"        # muted cream for secondary text
@@ -174,10 +175,32 @@ QLabel#coverArt {{
     background-color: {CONSOLE};
     color: {MUTED};
 }}
-QWidget#sidebar {{
+QWidget#toolRail {{
+    background-color: {RAIL_SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+}}
+QWidget#playlistDeck {{
     background-color: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: {RADIUS}px;
+}}
+QPushButton#railNav {{
+    background-color: transparent;
+    color: {MUTED};
+    border: none;
+    border-radius: {RADIUS_SM}px;
+    font-size: 20px;
+}}
+QPushButton#railNav:hover {{
+    background-color: {BG};
+    color: {ORANGE};
+}}
+QPushButton#railNav:checked {{
+    background-color: {BG};
+    color: {ORANGE};
+    font-weight: bold;
+    border-left: 3px solid {ORANGE};
 }}
 QLabel#sidebarSection {{
     color: {MUTED};
@@ -185,25 +208,6 @@ QLabel#sidebarSection {{
     font-weight: bold;
     letter-spacing: 2px;
     padding: 8px 10px 2px 10px;
-}}
-QPushButton#sidebarNav {{
-    background-color: transparent;
-    color: {INK};
-    border: none;
-    border-radius: {RADIUS_SM}px;
-    text-align: left;
-    padding: 8px 10px;
-    letter-spacing: 1px;
-}}
-QPushButton#sidebarNav:hover {{
-    background-color: {BG};
-    color: {ORANGE};
-}}
-QPushButton#sidebarNav:checked {{
-    background-color: {BG};
-    color: {ORANGE};
-    font-weight: bold;
-    border-left: 3px solid {ORANGE};
 }}
 QListWidget#sidebarList {{
     background-color: transparent;
@@ -221,5 +225,25 @@ QListWidget#sidebarList::item:hover {{
 QListWidget#sidebarList::item:selected {{
     background-color: {BG};
     color: {ORANGE};
+}}
+QMenu {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS_SM}px;
+    color: {INK};
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 7px 16px;
+    border-radius: {RADIUS_SM}px;
+}}
+QMenu::item:selected {{
+    background-color: {BG};
+    color: {ORANGE};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {BORDER};
+    margin: 4px 6px;
 }}
 """

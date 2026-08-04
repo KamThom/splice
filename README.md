@@ -37,8 +37,8 @@ python splice.py
 - `splice/sidebar.py` — the left-hand navigation (Library/Search, Playlists, Tools)
 - `splice/workers.py` — background `QThread` workers that shell out to ffmpeg/ffprobe/yt-dlp
 - `splice/tagging.py` — `mutagen`-based ID3 read/write helpers (no Qt dependency)
-- `splice/library_view.py` — the Library home view and the ADD SOURCES migration wizard
-- `splice/library/` — the library backend: `db.py` (SQLite index), `scanner.py` (read-only tag/duration/hash reads), `naming.py` (destination paths), `playlists.py` (`.m3u8` read/write), `migrate.py` (scan/build `QThread` workers)
+- `splice/library_view.py` — the Library home view, the ADD SOURCES migration wizard, and the EXPORT dialog
+- `splice/library/` — the library backend: `db.py` (SQLite index), `scanner.py` (read-only tag/duration/hash reads), `naming.py` (destination paths), `playlists.py` (`.m3u8` read/write), `migrate.py` (scan/build `QThread` workers), `export.py` (device-export `QThread` worker)
 - `splice/main_window.py` — the main window: sidebar/page wiring and the Merge/Split/YouTube/Tags tool behavior
 
 ## Library
@@ -76,6 +76,21 @@ box up top filters by title/artist/album). The **In** column shows how many
 playlists a track belongs to. Playlists built by a migration appear in the
 sidebar — click one to see its contents (read-only for now; a full playlist
 editor is planned).
+
+## Export
+
+Click **EXPORT...** (in the Library view, or on a playlist's page to
+preselect just that one) to copy playlists and/or audiobooks out to a device —
+a USB mass-storage MP3 player, an SD card, a staging folder for another
+library tool to import from, whatever. Check what you want, choose a
+destination folder, click **EXPORT**. Each selected item gets its own
+subfolder there: playlist tracks are copied with a zero-padded position prefix
+(`001 - Title.mp3`) so devices with no playlist support just play them in the
+right order by folder listing; audiobook folders are copied as-is, since their
+filenames already preserve series order. Re-exporting is additive by default;
+check **"Replace existing contents..."** to clear each item's destination
+subfolder first instead of accumulating old copies. Your library is never
+modified by an export — this only ever writes into the destination you pick.
 
 **Output location** — Splice has no default output folder. On every launch it opens
 a folder picker asking where to save output (starting from your last choice, but you

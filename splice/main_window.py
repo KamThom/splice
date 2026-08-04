@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl
-from PyQt6.QtGui import QDesktopServices, QFont
+from PyQt6.QtGui import QAction, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,10 +23,10 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSizePolicy,
     QStackedWidget,
     QTabWidget,
     QVBoxLayout,
@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 from . import tagging
 from .library import db as libdb
 from .library_view import LibraryView, PlaylistView
-from .sidebar import Sidebar
+from .sidebar import PlaylistDeck, ToolRail
 from .styles import STYLESHEET
 from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, SplitDropZone, StatusDot
 from .workers import (
@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self.youtube_active_worker = None
         self._youtube_lookup_workers = []
         self._current_download_title = None
+        self._current_download_playlist_id = None
 
         self.setWindowTitle("Splice")
         self.resize(900, 840)
@@ -125,7 +126,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
 
         layout.addLayout(self._build_header())
-        layout.addLayout(self._build_output_bar())
         layout.addLayout(self._build_body(), stretch=1)
         layout.addWidget(self._build_console())
 
@@ -133,9 +133,16 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(14)
 
-        self.sidebar = Sidebar()
-        self.sidebar.navigate.connect(self._on_navigate)
-        row.addWidget(self.sidebar)
+        self.tool_rail = ToolRail()
+        self.tool_rail.navigate.connect(self._on_navigate)
+        self.tool_rail.tagsRequested.connect(self._open_batch_tags_fresh)
+        row.addWidget(self.tool_rail)
+
+        self.playlist_deck = PlaylistDeck()
+        self.playlist_deck.navigate.connect(self._on_navigate)
+        self.playlist_deck.createRequested.connect(self._create_playlist)
+        self.playlist_deck.renameRequested.connect(self._rename_playlist)
+        row.addWidget(self.playlist_deck)
 
         content_frame = QFrame()
         content_frame.setObjectName("panel")
@@ -150,6 +157,7 @@ class MainWindow(QMainWindow):
             lambda path: self._write_log(f"[{ts()}] Library location set to: {path}")
         )
         self.page_playlist = PlaylistView(self._get_library_root)
+        self.page_playlist.playlistsChanged.connect(self._refresh_sidebar_playlists)
         self.page_merge = self._build_merge_panel()
         self.page_split = self._build_split_panel()
         self.page_youtube = self._build_youtube_panel()
@@ -161,7 +169,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self.content_stack)
         row.addWidget(content_frame, stretch=1)
 
-        self.sidebar.select("library")
+        self.tool_rail.select("library")
         self._refresh_sidebar_playlists()
         return row
 
@@ -174,27 +182,108 @@ class MainWindow(QMainWindow):
 
     def _refresh_sidebar_playlists(self):
         if not self.library_root or not Path(self.library_root).exists():
-            self.sidebar.set_playlists([])
+            self.playlist_deck.set_playlists([])
+        else:
+            conn = libdb.open_db(self.library_root)
+            playlists = [(p["id"], p["name"]) for p in libdb.list_playlists(conn)]
+            conn.close()
+            self.playlist_deck.set_playlists(playlists)
+        self._refresh_youtube_playlist_combo()
+
+    def _refresh_youtube_playlist_combo(self):
+        combo = self.youtube_playlist_combo
+        previous = combo.currentData() if combo.count() else None
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("No playlist (library only)", None)
+        if self.library_root and Path(self.library_root).exists():
+            conn = libdb.open_db(self.library_root)
+            for p in libdb.list_playlists(conn):
+                combo.addItem(p["name"], p["id"])
+            conn.close()
+        combo.addItem("+ New Playlist...", "__new__")
+        idx = combo.findData(previous)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_youtube_playlist_combo_changed(self, index: int):
+        if self.youtube_playlist_combo.itemData(index) != "__new__":
+            return
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        if ok and name.strip() and self.library_root:
+            conn = libdb.open_db(self.library_root)
+            playlist_id = libdb.get_or_create_playlist(conn, name.strip())
+            conn.close()
+            self._refresh_sidebar_playlists()
+            idx = self.youtube_playlist_combo.findData(playlist_id)
+            self.youtube_playlist_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            if ok and name.strip() and not self.library_root:
+                QMessageBox.information(self, "No library yet", "Set up your library first (Library page -> gear menu -> ADD SOURCES).")
+            self.youtube_playlist_combo.setCurrentIndex(0)
+
+    def _create_playlist(self):
+        if not self.library_root:
+            QMessageBox.information(self, "No library yet", "Set up your library first (Library page -> gear menu -> ADD SOURCES).")
+            return
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        if not ok or not name.strip():
             return
         conn = libdb.open_db(self.library_root)
-        playlists = [(p["id"], p["name"]) for p in libdb.list_playlists(conn)]
+        libdb.get_or_create_playlist(conn, name.strip())
         conn.close()
-        self.sidebar.set_playlists(playlists)
+        self._refresh_sidebar_playlists()
+
+    def _rename_playlist(self, playlist_id: int, new_name: str):
+        if not self.library_root:
+            return
+        from .library.playlists import write_m3u8
+        conn = libdb.open_db(self.library_root)
+        row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+        old_name = row["name"] if row else None
+        libdb.rename_playlist(conn, playlist_id, new_name)
+        paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+        conn.close()
+
+        playlists_dir = Path(self.library_root) / "Playlists"
+        if old_name and old_name != new_name:
+            old_m3u8 = playlists_dir / f"{old_name}.m3u8"
+            if old_m3u8.exists():
+                old_m3u8.unlink()
+        write_m3u8(str(playlists_dir), new_name, paths, self.library_root)
+
+        self._refresh_sidebar_playlists()
+        if self.content_stack.currentWidget() is self.page_playlist:
+            self.page_playlist.show_playlist(playlist_id, new_name)
 
     def _fix_tags_for_path(self, path: str, track_id: int):
-        self.sidebar.select("tags")
+        self.tool_rail.select("tags")
         self._load_tag_file_from_path(path)
         # Loading always clears this; set it after, so saving knows to re-file
         # the track back into the library instead of just rewriting its ID3 tags.
         self._pending_library_refile = track_id
+        # Contextual entry (Fix Tags) always means the Single File sub-tab —
+        # force it back in case Batch Apply was left active from an earlier
+        # rail visit, so this never lands on the wrong sub-tab.
+        self.tag_mode_tabs.setCurrentIndex(0)
+
+    def _open_batch_tags_fresh(self):
+        """The Tags rail button's own click — unlike the contextual entry
+        points (Fix Tags, Send Segments to Tags), which load specific state
+        on purpose, opening Tags cold should never show a previous session's
+        leftover files."""
+        self.batch_tag_list.clear()
+        self.tag_mode_tabs.setCurrentIndex(1)
 
     def _on_navigate(self, kind: str, payload):
         if kind == "playlist":
+            self.tool_rail.deselect_all()
             playlist_id, name = payload
             self.page_playlist.show_playlist(playlist_id, name)
             self.content_stack.setCurrentWidget(self.page_playlist)
             return
 
+        self.playlist_deck.clear_selection()
         pages = {
             "library": self.page_library,
             "merge": self.page_merge,
@@ -202,50 +291,54 @@ class MainWindow(QMainWindow):
             "youtube": self.page_youtube,
             "tags": self.page_tags,
         }
-        if kind == "search":
-            self.content_stack.setCurrentWidget(self.page_library)
-            self.page_library.search_edit.setFocus()
-            return
         page = pages.get(kind)
         if page is not None:
             self.content_stack.setCurrentWidget(page)
 
     def _build_header(self):
-        row = QVBoxLayout()
-        row.setSpacing(2)
+        outer = QVBoxLayout()
+        outer.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
         title = QLabel("SPLICE")
         title.setObjectName("appTitle")
         subtitle = QLabel("AUDIO SPLICING UNIT // MK.III")
         subtitle.setObjectName("appSubtitle")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        top_row.addLayout(title_col, stretch=1)
+
+        # Output folder used to be a permanently-visible bar; Merge/Split/YouTube
+        # only need it occasionally, so it's tucked behind a menu instead —
+        # same declutter pattern as the Library view's settings gear.
+        self.output_settings_btn = QPushButton("⚙ OUTPUT")
+        self.output_menu = QMenu(self)
+        self.output_location_action = QAction("", self)
+        self.output_location_action.setEnabled(False)
+        choose_action = QAction("CHOOSE FOLDER...", self)
+        choose_action.triggered.connect(self._choose_output_dir)
+        open_action = QAction("OPEN FOLDER", self)
+        open_action.triggered.connect(self._open_output_dir)
+        self.output_menu.addAction(self.output_location_action)
+        self.output_menu.addSeparator()
+        self.output_menu.addAction(choose_action)
+        self.output_menu.addAction(open_action)
+        self.output_settings_btn.setMenu(self.output_menu)
+        top_row.addWidget(self.output_settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
+
+        outer.addLayout(top_row)
         rule = QFrame()
         rule.setObjectName("rule")
-        row.addWidget(title)
-        row.addWidget(subtitle)
-        row.addSpacing(6)
-        row.addWidget(rule)
-        return row
-
-    def _build_output_bar(self):
-        row = QHBoxLayout()
-        self.output_btn = QPushButton()
-        self.output_btn.setObjectName("outputBar")
-        self.output_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.output_btn.clicked.connect(self._choose_output_dir)
+        outer.addWidget(rule)
         self._refresh_output_label()
-
-        open_btn = QPushButton("OPEN")
-        open_btn.setFixedWidth(70)
-        open_btn.clicked.connect(self._open_output_dir)
-
-        row.addWidget(self.output_btn, stretch=1)
-        row.addWidget(open_btn)
-        return row
+        return outer
 
     def _refresh_output_label(self):
-        if self.output_dir:
-            self.output_btn.setText(f"OUTPUT ▸  {self.output_dir}   (click to change)")
-        else:
-            self.output_btn.setText("OUTPUT ▸  (no folder chosen yet)   (click to change)")
+        text = self.output_dir if self.output_dir else "(no folder chosen yet)"
+        self.output_location_action.setText(f"Current: {text}")
+        self.output_settings_btn.setToolTip(text)
 
     def _build_merge_panel(self):
         widget, layout = tab_content("MERGE MODULE — combine multi-part audiobooks")
@@ -360,6 +453,14 @@ class MainWindow(QMainWindow):
         self.youtube_quality_combo.setCurrentIndex(3)
         self.youtube_quality_combo.currentIndexChanged.connect(self._persist_youtube_quality)
         add_row.addWidget(self.youtube_quality_combo)
+
+        playlist_label = QLabel("Add to:")
+        playlist_label.setObjectName("muted")
+        add_row.addWidget(playlist_label)
+        self.youtube_playlist_combo = QComboBox()
+        self._refresh_youtube_playlist_combo()
+        self.youtube_playlist_combo.currentIndexChanged.connect(self._on_youtube_playlist_combo_changed)
+        add_row.addWidget(self.youtube_playlist_combo)
         layout.addLayout(add_row)
 
         self.youtube_now_label = QLabel("Queue idle")
@@ -542,9 +643,13 @@ class MainWindow(QMainWindow):
         self.status_dot = StatusDot()
         self.status_label = QLabel("STANDBY")
         self.status_label.setObjectName("muted")
+        self.console_toggle_btn = QPushButton("SHOW ▾")
+        self.console_toggle_btn.setFixedWidth(90)
+        self.console_toggle_btn.clicked.connect(self._toggle_console)
         status_row.addWidget(self.status_dot)
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
+        status_row.addWidget(self.console_toggle_btn)
         layout.addLayout(status_row)
 
         self.log_box = QPlainTextEdit()
@@ -552,10 +657,16 @@ class MainWindow(QMainWindow):
         font = QFont("Menlo")
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.log_box.setFont(font)
+        self.log_box.setVisible(False)  # collapsed by default — declutters the always-on panel
         layout.addWidget(self.log_box)
         return frame
 
     # ---- shared behavior ----
+
+    def _toggle_console(self):
+        visible = not self.log_box.isVisible()
+        self.log_box.setVisible(visible)
+        self.console_toggle_btn.setText("HIDE ▴" if visible else "SHOW ▾")
 
     def _write_log(self, text: str):
         self.log_box.appendPlainText(text)
@@ -674,7 +785,7 @@ class MainWindow(QMainWindow):
         self.merge_list.clear()
 
         if self.merge_then_split_check.isChecked():
-            self.sidebar.select("split")
+            self.tool_rail.select("split")
             self._run_split([out_path])
 
     def _on_merge_err(self, err: str):
@@ -748,7 +859,7 @@ class MainWindow(QMainWindow):
         if not self._last_split_segments:
             return
         self.batch_tag_list.add_paths(self._last_split_segments)
-        self.sidebar.select("tags")
+        self.tool_rail.select("tags")
         self.tag_mode_tabs.setCurrentIndex(1)  # BATCH APPLY sub-tab
         self._write_log(f"[{ts()}] Sent {len(self._last_split_segments)} segment(s) to Tags -> Batch Apply.")
 
@@ -773,18 +884,23 @@ class MainWindow(QMainWindow):
         urls = [line.strip() for line in text.splitlines() if line.strip()]
         self.youtube_url_edit.clear()
         quality = self.youtube_quality_combo.currentData()
+        playlist_id = self.youtube_playlist_combo.currentData()
+        if playlist_id == "__new__":
+            playlist_id = None  # shouldn't happen (combo resets after creating), but never queue with a sentinel
 
         for url in urls:
             if looks_like_playlist_url(url):
                 self._write_log(f"[{ts()}] Expanding playlist: {url}")
                 expander = PlaylistExpandWorker(url)
                 self._youtube_lookup_workers.append(expander)
-                expander.expanded.connect(lambda results, q=quality: self._on_playlist_expanded(results, q))
+                expander.expanded.connect(
+                    lambda results, q=quality, p=playlist_id: self._on_playlist_expanded(results, q, p)
+                )
                 expander.failed.connect(self._on_playlist_expand_failed)
                 expander.finished.connect(lambda w=expander: self._forget_lookup_worker(w))
                 expander.start()
             else:
-                self._enqueue_youtube_url(url, url, quality)
+                self._enqueue_youtube_url(url, url, quality, playlist_id)
                 lookup = TitleLookupWorker(url)
                 self._youtube_lookup_workers.append(lookup)
                 lookup.resolved.connect(self._on_title_resolved)
@@ -798,10 +914,10 @@ class MainWindow(QMainWindow):
         if worker in self._youtube_lookup_workers:
             self._youtube_lookup_workers.remove(worker)
 
-    def _on_playlist_expanded(self, results: list, quality: str):
+    def _on_playlist_expanded(self, results: list, quality: str, playlist_id):
         self._write_log(f"[{ts()}]   Found {len(results)} video(s) in playlist.")
         for url, title in results:
-            self._enqueue_youtube_url(url, title, quality)
+            self._enqueue_youtube_url(url, title, quality, playlist_id)
         self._pump_youtube_queue()
 
     def _on_playlist_expand_failed(self, err: str):
@@ -825,14 +941,14 @@ class MainWindow(QMainWindow):
             self._current_download_title = title
             self.youtube_now_label.setText(f"Downloading: {title}")
 
-    def _enqueue_youtube_url(self, url: str, title: str, quality: str):
+    def _enqueue_youtube_url(self, url: str, title: str, quality: str, playlist_id=None):
         if self.youtube_active_worker is not None and self.youtube_active_worker.url == url:
             return
         for i in range(self.youtube_queue_list.count()):
             if self.youtube_queue_list.item(i).data(Qt.ItemDataRole.UserRole)["url"] == url:
                 return
         item = QListWidgetItem(title)
-        item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality})
+        item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id})
         self.youtube_queue_list.addItem(item)
         self._persist_youtube_queue()
 
@@ -853,6 +969,7 @@ class MainWindow(QMainWindow):
             item = self.youtube_queue_list.takeItem(0)
             data = item.data(Qt.ItemDataRole.UserRole)
             self._current_download_title = data["title"]
+            self._current_download_playlist_id = data.get("playlist_id")
             self.youtube_now_label.setText(f"Downloading: {data['title']}")
             self.youtube_progress.set_idle()
             self.youtube_worker = YouTubeWorker(data["url"], self.output_dir, data.get("quality", "192"))
@@ -865,6 +982,7 @@ class MainWindow(QMainWindow):
             self.youtube_worker.start()
         elif self.youtube_active_worker is None:
             self._current_download_title = None
+            self._current_download_playlist_id = None
             self.youtube_now_label.setText("Queue idle")
 
         self.youtube_cancel_btn.setEnabled(self.youtube_active_worker is not None)
@@ -877,7 +995,42 @@ class MainWindow(QMainWindow):
     def _on_youtube_ok(self, out_path: str):
         self.youtube_progress.set_done("COMPLETE")
         self.youtube_active_worker = None
+        self._file_youtube_download(out_path, self._current_download_playlist_id)
         self._pump_youtube_queue()
+
+    def _file_youtube_download(self, out_path: str, playlist_id):
+        """Files a completed download into the library (additive — the file
+        stays in the output folder either way) and, if a target playlist was
+        picked when it was queued, adds it there too. Skipped quietly if no
+        library is set up yet."""
+        if not self.library_root:
+            return
+        from .library.migrate import file_single_track
+        from .library.playlists import write_m3u8
+
+        track_id, status = file_single_track(self.library_root, out_path)
+        if track_id is None:
+            self._write_log(f"[{ts()}] Could not file download into library: {status}")
+            return
+        if status == "added":
+            self._write_log(f"[{ts()}] Filed into library: {Path(out_path).name}")
+
+        if playlist_id is not None:
+            conn = libdb.open_db(self.library_root)
+            position = libdb.next_playlist_position(conn, playlist_id)
+            libdb.add_playlist_track(conn, playlist_id, track_id, position)
+            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+            paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+            conn.close()
+            if row:
+                write_m3u8(str(Path(self.library_root) / "Playlists"), row["name"], paths, self.library_root)
+                self._write_log(f"[{ts()}] Added to playlist: {row['name']}")
+            if self.content_stack.currentWidget() is self.page_playlist:
+                self.page_playlist.refresh()
+
+        self._refresh_sidebar_playlists()
+        if self.content_stack.currentWidget() is self.page_library:
+            self.page_library.refresh()
 
     def _on_youtube_err(self, err: str):
         self.youtube_progress.set_error("FAILED")
@@ -907,6 +1060,7 @@ class MainWindow(QMainWindow):
                 "url": self.youtube_active_worker.url,
                 "title": self._current_download_title or self.youtube_active_worker.url,
                 "quality": self.youtube_active_worker.quality,
+                "playlist_id": self._current_download_playlist_id,
             })
         for i in range(self.youtube_queue_list.count()):
             entries.append(self.youtube_queue_list.item(i).data(Qt.ItemDataRole.UserRole))
@@ -937,8 +1091,9 @@ class MainWindow(QMainWindow):
                     continue
                 title = entry.get("title") or url
                 quality = entry.get("quality", "192")
+                playlist_id = entry.get("playlist_id")
                 item = QListWidgetItem(title)
-                item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality})
+                item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id})
                 self.youtube_queue_list.addItem(item)
             self._pump_youtube_queue()
         else:

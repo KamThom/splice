@@ -154,3 +154,37 @@ def list_unresolved_fuzzy_dupes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def resolve_fuzzy_dupe(conn: sqlite3.Connection, dupe_id: int):
     conn.execute("UPDATE fuzzy_dupes SET resolved = 1 WHERE id = ?", (dupe_id,))
     conn.commit()
+
+
+def rename_playlist(conn: sqlite3.Connection, playlist_id: int, new_name: str):
+    conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
+    conn.commit()
+
+
+def delete_playlist(conn: sqlite3.Connection, playlist_id: int):
+    conn.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,))
+    conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+    conn.commit()
+
+
+def remove_playlist_track(conn: sqlite3.Connection, playlist_id: int, track_id: int):
+    conn.execute(
+        "DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?", (playlist_id, track_id)
+    )
+    conn.commit()
+
+
+def reorder_playlist_tracks(conn: sqlite3.Connection, playlist_id: int, ordered_track_ids: list[int]):
+    for position, track_id in enumerate(ordered_track_ids):
+        conn.execute(
+            "UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?",
+            (position, playlist_id, track_id),
+        )
+    conn.commit()
+
+
+def playlist_track_ids(conn: sqlite3.Connection, playlist_id: int) -> set[int]:
+    rows = conn.execute(
+        "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
+    ).fetchall()
+    return {row["track_id"] for row in rows}

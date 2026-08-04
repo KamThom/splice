@@ -4,9 +4,11 @@ extends the library from existing folders."""
 
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QListView,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -28,8 +31,11 @@ from PyQt6.QtWidgets import (
 )
 
 from .library import db as libdb
+from .library.export import ExportItem, ExportReport, ExportWorker, list_audiobook_entries
 from .library.migrate import LibraryBuildWorker, LibraryScanWorker, MusicSource
+from .library.playlists import write_m3u8
 from .widgets import LevelGauge
+from .workers import sanitize_filename
 
 
 def choose_multiple_directories(parent, caption: str, start_dir: str) -> list[str]:
@@ -283,6 +289,203 @@ class LibraryMigrationDialog(QDialog):
         self.report_label.setText(text)
 
 
+class ExportDialog(QDialog):
+    """Copies selected playlists / audiobook entries out of the library onto
+    an external device (or a staging folder for something like iTunes to
+    import from). Opened either from LibraryView (nothing preselected) or
+    from PlaylistView (that one playlist preselected)."""
+
+    def __init__(self, parent, library_root: str, preselected_playlist_id: int | None = None):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.settings = QSettings("Thomas", "Splice")
+
+        title = "Export"
+        preselect_row = None
+
+        self.resize(560, 560)
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "Check the playlists and/or audiobooks you want to copy out. Each one lands "
+            "in its own folder at the destination, in the right play order — for devices "
+            "like the Shokz that have no playlist support and just play files in folder order."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget, stretch=1)
+
+        conn = libdb.open_db(library_root)
+        playlists = libdb.list_playlists(conn)
+        conn.close()
+        audiobooks = list_audiobook_entries(library_root)
+
+        if playlists:
+            self._add_header("PLAYLISTS")
+            for p in playlists:
+                item = self._add_checkable(p["name"], ExportItem("playlist", p["id"], p["name"]))
+                if preselected_playlist_id is not None and p["id"] == preselected_playlist_id:
+                    preselect_row = item
+                    title = f"Export — {p['name']}"
+
+        if audiobooks:
+            self._add_header("AUDIOBOOKS")
+            for rel_path, name in audiobooks:
+                self._add_checkable(name, ExportItem("audiobook", rel_path, name))
+
+        if preselect_row is not None:
+            preselect_row.setCheckState(Qt.CheckState.Checked)
+
+        self.setWindowTitle(title)
+
+        dest_row = QHBoxLayout()
+        self.dest_edit = QLineEdit()
+        self.dest_edit.setReadOnly(True)
+        self.dest_edit.setText(str(self.settings.value("export_destination", "") or ""))
+        dest_btn = QPushButton("CHOOSE...")
+        dest_btn.clicked.connect(self._choose_destination)
+        dest_row.addWidget(self.dest_edit, stretch=1)
+        dest_row.addWidget(dest_btn)
+        layout.addLayout(dest_row)
+
+        self.replace_check = QCheckBox("Replace existing contents of each selected item's destination folder")
+        layout.addWidget(self.replace_check)
+        replace_hint = QLabel("Only touches that one subfolder per item — never anything else at the destination.")
+        replace_hint.setObjectName("muted")
+        replace_hint.setWordWrap(True)
+        layout.addWidget(replace_hint)
+
+        action_row = QHBoxLayout()
+        self.export_btn = QPushButton("EXPORT")
+        self.export_btn.setObjectName("primary")
+        self.export_btn.clicked.connect(self._run_export)
+        self.cancel_btn = QPushButton("CANCEL")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_export)
+        action_row.addWidget(self.export_btn)
+        action_row.addStretch(1)
+        action_row.addWidget(self.cancel_btn)
+        layout.addLayout(action_row)
+
+        self.gauge = LevelGauge()
+        layout.addWidget(self.gauge)
+
+        self.report_label = QLabel("")
+        self.report_label.setObjectName("muted")
+        self.report_label.setWordWrap(True)
+        layout.addWidget(self.report_label)
+
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("CLOSE")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def _add_header(self, text: str):
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        self.list_widget.addItem(item)
+
+    def _add_checkable(self, label: str, export_item: ExportItem) -> QListWidgetItem:
+        item = QListWidgetItem(f"    {label}")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Unchecked)
+        item.setData(Qt.ItemDataRole.UserRole, export_item)
+        self.list_widget.addItem(item)
+        return item
+
+    def _choose_destination(self):
+        start_dir = self.dest_edit.text() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "Choose export destination", start_dir)
+        if chosen:
+            self.dest_edit.setText(chosen)
+
+    def _log(self, msg: str):
+        self.log_box.appendPlainText(msg)
+
+    def _collect_selected_items(self) -> list[ExportItem]:
+        items = []
+        for i in range(self.list_widget.count()):
+            row = self.list_widget.item(i)
+            if row.flags() & Qt.ItemFlag.ItemIsUserCheckable and row.checkState() == Qt.CheckState.Checked:
+                items.append(row.data(Qt.ItemDataRole.UserRole))
+        return items
+
+    def _run_export(self):
+        items = self._collect_selected_items()
+        if not items:
+            QMessageBox.warning(self, "Nothing selected", "Check at least one playlist or audiobook to export.")
+            return
+
+        destination = self.dest_edit.text().strip()
+        if not destination or not Path(destination).exists():
+            QMessageBox.warning(self, "No destination", "Choose a destination folder first.")
+            return
+
+        seen_names = {}
+        for item in items:
+            sanitized = sanitize_filename(item.name)
+            if sanitized in seen_names:
+                QMessageBox.warning(
+                    self, "Naming collision",
+                    f"'{item.name}' and '{seen_names[sanitized]}' would both export to the folder "
+                    f"'{sanitized}' — rename one or deselect it.",
+                )
+                return
+            seen_names[sanitized] = item.name
+
+        self.settings.setValue("export_destination", destination)
+
+        self.export_btn.setEnabled(False)
+        self.list_widget.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.gauge.set_idle()
+        self.report_label.setText("")
+
+        self._worker = ExportWorker(self.library_root, destination, items, self.replace_check.isChecked())
+        self._worker.log.connect(self._log)
+        self._worker.progress.connect(self.gauge.set_progress)
+        self._worker.finished_ok.connect(self._on_export_done)
+        self._worker.cancelled.connect(self._on_export_cancelled)
+        self._worker.start()
+
+    def _cancel_export(self):
+        if hasattr(self, "_worker"):
+            self._worker.cancel()
+
+    def _on_export_done(self, report: ExportReport):
+        self.gauge.set_done("EXPORT COMPLETE")
+        self.export_btn.setEnabled(True)
+        self.list_widget.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        text = (
+            f"{report.items_exported} item(s) exported ({report.items_replaced} replaced), "
+            f"{report.copied_count} file(s) copied, {report.skipped_count} missing, "
+            f"{report.failed_count} failed."
+        )
+        if report.skipped_count or report.failed_count:
+            text += " See the log below for detail."
+        self.report_label.setText(text)
+
+    def _on_export_cancelled(self):
+        self.gauge.set_cancelled("CANCELLED")
+        self.export_btn.setEnabled(True)
+        self.list_widget.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.report_label.setText("Export cancelled — items already copied before cancelling are kept.")
+
+
 class LibraryView(QWidget):
     """The app's home screen. get_library_root/set_library_root let this view
     share the persisted library location with MainWindow without owning
@@ -320,10 +523,19 @@ class LibraryView(QWidget):
         self.search_edit.setPlaceholderText("Search title, artist, album...")
         self.search_edit.textChanged.connect(lambda: self._search_debounce.start())
         top_row.addWidget(self.search_edit, stretch=1)
-        add_sources_btn = QPushButton("ADD SOURCES...")
-        add_sources_btn.setObjectName("primary")
-        add_sources_btn.clicked.connect(self._open_migration_dialog)
-        top_row.addWidget(add_sources_btn)
+
+        settings_btn = QPushButton("⚙")
+        settings_btn.setFixedWidth(34)
+        settings_btn.setToolTip("Library settings")
+        settings_menu = QMenu(self)
+        add_sources_action = QAction("ADD SOURCES...", self)
+        add_sources_action.triggered.connect(self._open_migration_dialog)
+        export_action = QAction("EXPORT...", self)
+        export_action.triggered.connect(self._open_export_dialog)
+        settings_menu.addAction(add_sources_action)
+        settings_menu.addAction(export_action)
+        settings_btn.setMenu(settings_menu)
+        top_row.addWidget(settings_btn)
         layout.addLayout(top_row)
 
         self.sub_tabs = QTabWidget()
@@ -338,19 +550,26 @@ class LibraryView(QWidget):
         self.sub_tabs.addTab(self.unsorted_list, "UNSORTED")
         layout.addWidget(self.sub_tabs, stretch=1)
 
-        dupe_row = QHBoxLayout()
+        self.dupe_actions = QWidget()
+        dupe_row = QHBoxLayout(self.dupe_actions)
+        dupe_row.setContentsMargins(0, 0, 0, 0)
         dupe_row.addStretch(1)
         dismiss_btn = QPushButton("DISMISS SELECTED")
         dismiss_btn.clicked.connect(self._dismiss_selected_dupe)
         dupe_row.addWidget(dismiss_btn)
-        layout.addLayout(dupe_row)
+        layout.addWidget(self.dupe_actions)
 
-        unsorted_row = QHBoxLayout()
+        self.unsorted_actions = QWidget()
+        unsorted_row = QHBoxLayout(self.unsorted_actions)
+        unsorted_row.setContentsMargins(0, 0, 0, 0)
         unsorted_row.addStretch(1)
         fix_tags_btn = QPushButton("FIX TAGS")
         fix_tags_btn.clicked.connect(self._fix_selected_unsorted_tags)
         unsorted_row.addWidget(fix_tags_btn)
-        layout.addLayout(unsorted_row)
+        layout.addWidget(self.unsorted_actions)
+
+        self.sub_tabs.currentChanged.connect(self._update_sub_tab_actions)
+        self._update_sub_tab_actions(self.sub_tabs.currentIndex())
 
         self.empty_hint = QLabel("")
         self.empty_hint.setObjectName("muted")
@@ -358,6 +577,10 @@ class LibraryView(QWidget):
         layout.addWidget(self.empty_hint)
 
         self.refresh()
+
+    def _update_sub_tab_actions(self, index: int):
+        self.dupe_actions.setVisible(index == 2)  # DUPLICATES
+        self.unsorted_actions.setVisible(index == 3)  # UNSORTED
 
     # ---- data loading ----
 
@@ -378,6 +601,13 @@ class LibraryView(QWidget):
         dialog.exec()
         if dialog.build_succeeded:
             self.refresh()
+
+    def _open_export_dialog(self):
+        library_root = self._get_library_root()
+        if not library_root or not Path(library_root).exists():
+            QMessageBox.information(self, "No library yet", "Add sources and build your library first.")
+            return
+        ExportDialog(self, library_root).exec()
 
     def _refresh_location_label(self):
         root = self._get_library_root()
@@ -489,15 +719,88 @@ class LibraryView(QWidget):
         self.fixTagsRequested.emit(data["path"], data["track_id"])
 
 
+class AddTracksDialog(QDialog):
+    """Search + multi-select existing library tracks to add to a playlist.
+    Music only — playlists have been a music-only concept throughout this
+    app; audiobooks live in their own tab, not playlists."""
+
+    def __init__(self, parent, library_root: str, playlist_id: int):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.playlist_id = playlist_id
+        self.added_count = 0
+        self.setWindowTitle("Add Tracks")
+        self.resize(480, 520)
+
+        layout = QVBoxLayout(self)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search title, artist, album...")
+        self.search_edit.textChanged.connect(self._reload)
+        layout.addWidget(self.search_edit)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.list_widget, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("CLOSE")
+        cancel_btn.clicked.connect(self.reject)
+        add_btn = QPushButton("ADD SELECTED")
+        add_btn.setObjectName("primary")
+        add_btn.clicked.connect(self._add_selected)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        self._reload()
+
+    def _reload(self):
+        query = self.search_edit.text().strip().lower()
+        conn = libdb.open_db(self.library_root)
+        existing_ids = libdb.playlist_track_ids(conn, self.playlist_id)
+        tracks = libdb.list_tracks(conn, "music")
+        conn.close()
+
+        self.list_widget.clear()
+        for t in tracks:
+            if t["id"] in existing_ids:
+                continue
+            label = f"{t['title'] or Path(t['library_path']).stem}  —  {t['artist'] or ''}"
+            if query and query not in label.lower() and query not in (t["album"] or "").lower():
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, t["id"])
+            self.list_widget.addItem(item)
+
+    def _add_selected(self):
+        items = self.list_widget.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
+            return
+        conn = libdb.open_db(self.library_root)
+        position = libdb.next_playlist_position(conn, self.playlist_id)
+        for item in items:
+            libdb.add_playlist_track(conn, self.playlist_id, item.data(Qt.ItemDataRole.UserRole), position)
+            position += 1
+        conn.close()
+        self.added_count = len(items)
+        self.accept()
+
+
 class PlaylistView(QWidget):
-    """Read-only view of one playlist's contents — the same track table as the
-    Library view, filtered to just that playlist. No editing yet (drag reorder,
-    add/remove tracks) — that's a separate, later phase."""
+    """Editable view of one playlist: drag to reorder, add tracks from the
+    library, remove tracks, delete the whole playlist. Every mutation
+    rewrites the .m3u8 immediately, keeping the on-disk file in sync with
+    the DB on every change rather than only at migration-build time."""
+
+    playlistsChanged = pyqtSignal()  # tells MainWindow to refresh the sidebar deck / library counts
 
     def __init__(self, get_library_root):
         super().__init__()
         self._get_library_root = get_library_root
         self._playlist_id = None
+        self._playlist_name = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 14)
@@ -507,27 +810,138 @@ class PlaylistView(QWidget):
         self.title_label.setObjectName("panelTitle")
         layout.addWidget(self.title_label)
 
-        self.table = make_track_table()
-        layout.addWidget(self.table, stretch=1)
+        top_row = QHBoxLayout()
+        add_btn = QPushButton("ADD TRACKS...")
+        add_btn.clicked.connect(self._open_add_tracks_dialog)
+        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn.clicked.connect(self._remove_selected)
+        top_row.addWidget(add_btn)
+        top_row.addWidget(remove_btn)
+        top_row.addStretch(1)
+        export_btn = QPushButton("EXPORT...")
+        export_btn.clicked.connect(self._open_export_dialog)
+        delete_btn = QPushButton("DELETE PLAYLIST")
+        delete_btn.clicked.connect(self._delete_playlist)
+        top_row.addWidget(export_btn)
+        top_row.addWidget(delete_btn)
+        layout.addLayout(top_row)
+
+        hint = QLabel("Drag tracks to reorder.")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        self.track_list = QListWidget()
+        self.track_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.track_list.model().rowsMoved.connect(lambda *a: self._persist_order())
+        layout.addWidget(self.track_list, stretch=1)
 
     def show_playlist(self, playlist_id: int, name: str):
         self._playlist_id = playlist_id
+        self._playlist_name = name
         self.title_label.setText(f"PLAYLIST — {name}")
         self.refresh()
 
+    def _library_root_or_none(self) -> str | None:
+        library_root = self._get_library_root()
+        if not library_root or not Path(library_root).exists():
+            return None
+        return library_root
+
     def refresh(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        self.track_list.clear()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        paths = libdb.playlist_track_paths_in_order(conn, self._playlist_id)
+        for path in paths:
+            row = conn.execute("SELECT * FROM tracks WHERE library_path = ?", (path,)).fetchone()
+            if row:
+                item = QListWidgetItem(f"{row['title'] or Path(path).stem}  —  {row['artist'] or ''}")
+                item.setData(Qt.ItemDataRole.UserRole, row["id"])
+                self.track_list.addItem(item)
+        conn.close()
+
+    def _write_current_m3u8(self, library_root: str):
+        conn = libdb.open_db(library_root)
+        paths = libdb.playlist_track_paths_in_order(conn, self._playlist_id)
+        conn.close()
+        write_m3u8(str(Path(library_root) / "Playlists"), self._playlist_name, paths, library_root)
+
+    def _persist_order(self):
+        library_root = self._library_root_or_none()
+        if not library_root or self._playlist_id is None:
+            return
+        track_ids = [self.track_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.track_list.count())]
+        conn = libdb.open_db(library_root)
+        libdb.reorder_playlist_tracks(conn, self._playlist_id, track_ids)
+        conn.close()
+        self._write_current_m3u8(library_root)
+        self.playlistsChanged.emit()
+
+    def _remove_selected(self):
+        items = self.track_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        for item in items:
+            libdb.remove_playlist_track(conn, self._playlist_id, item.data(Qt.ItemDataRole.UserRole))
+        conn.close()
+        self._write_current_m3u8(library_root)
+        self.refresh()
+        self.playlistsChanged.emit()
+
+    def _open_add_tracks_dialog(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            QMessageBox.information(self, "No library yet", "Add sources and build your library first.")
+            return
+        dialog = AddTracksDialog(self, library_root, self._playlist_id)
+        if dialog.exec() and dialog.added_count:
+            self._write_current_m3u8(library_root)
+            self.refresh()
+            self.playlistsChanged.emit()
+
+    def _delete_playlist(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        reply = QMessageBox.question(
+            self, "Delete playlist",
+            f"Delete '{self._playlist_name}'? This only removes the playlist itself — "
+            f"none of your music files are touched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        conn = libdb.open_db(library_root)
+        libdb.delete_playlist(conn, self._playlist_id)
+        conn.close()
+        m3u8_path = Path(library_root) / "Playlists" / f"{self._playlist_name}.m3u8"
+        if m3u8_path.exists():
+            m3u8_path.unlink()
+        self._playlist_id = None
+        self._playlist_name = None
+        self.track_list.clear()
+        self.title_label.setText("PLAYLIST")
+        self.playlistsChanged.emit()
+
+    def _open_export_dialog(self):
         if self._playlist_id is None:
             return
         library_root = self._get_library_root()
         if not library_root:
             return
-        conn = libdb.open_db(library_root)
-        paths = libdb.playlist_track_paths_in_order(conn, self._playlist_id)
-        tracks = []
-        for path in paths:
-            row = conn.execute("SELECT * FROM tracks WHERE library_path = ?", (path,)).fetchone()
-            if row:
-                tracks.append(row)
-        membership = libdb.playlist_membership_counts(conn)
-        populate_track_table(self.table, tracks, membership)
-        conn.close()
+        ExportDialog(self, library_root, preselected_playlist_id=self._playlist_id).exec()

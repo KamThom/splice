@@ -1,101 +1,139 @@
-"""Left sidebar navigation: Library/Search at top, a hand-curated Playlists list,
-and a Tools section (Merge/Split/YouTube/Tags) — replaces the old top tab bar."""
+"""Left-hand navigation, split into two independent widgets: a slim icon-only
+ToolRail (Library home + Merge/Split/YouTube/Tags) and a full-height
+PlaylistDeck. Splitting them (rather than one long stacked sidebar) is what
+lets Playlists get its own single-scrollbar column instead of a capped,
+double-scrolling section fighting the tools list for space."""
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
 
-TOOLS = [("merge", "MERGE"), ("split", "SPLIT"), ("youtube", "YOUTUBE"), ("tags", "TAGS")]
+# (kind, tooltip label, icon glyph)
+TOOLS = [("merge", "MERGE", "▤"), ("split", "SPLIT", "✂"), ("youtube", "YOUTUBE", "▾"), ("tags", "TAGS", "#")]
 
-PLAYLIST_MAX_VISIBLE_ROWS = 6
 
-
-class Sidebar(QWidget):
-    """Emits navigate(kind, payload) on any selection:
-    kind is "library" | "search" | one of the TOOLS keys | "playlist", payload
-    is None except for "playlist" (a (playlist_id, name) tuple)."""
+class ToolRail(QWidget):
+    """Emits navigate(kind, None) on Library/Merge/Split/YouTube. The Tags
+    button additionally emits tagsRequested — MainWindow uses that to reset
+    Batch Apply to an empty state before showing it, so opening Tags cold
+    never shows a previous session's leftover data. (Tags is still reachable
+    generically via select("tags") too, for the contextual Fix Tags / Send
+    Segments to Tags entry points, which set up their own state and don't
+    want the reset.)"""
 
     navigate = pyqtSignal(str, object)
+    tagsRequested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setObjectName("sidebar")
-        self.setFixedWidth(190)
+        self.setObjectName("toolRail")
+        self.setFixedWidth(72)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 10, 6, 10)
-        layout.setSpacing(2)
+        layout.setContentsMargins(8, 14, 8, 12)
+        layout.setSpacing(6)
 
         self._nav_buttons: dict[str, QPushButton] = {}
 
-        self._add_nav_button(layout, "library", "LIBRARY")
-        self._add_nav_button(layout, "search", "SEARCH")
-
+        self._add_nav_button(layout, "library", "LIBRARY", "◆")
         layout.addSpacing(10)
-        self._playlists_label = self._section_label("PLAYLISTS")
-        layout.addWidget(self._playlists_label)
-        self.playlist_list = QListWidget()
-        self.playlist_list.setObjectName("sidebarList")
-        self.playlist_list.itemClicked.connect(self._on_playlist_clicked)
-        layout.addWidget(self.playlist_list)
-        self._resize_playlist_list()  # starts empty -> collapsed, no gap
-
-        layout.addSpacing(10)
-        layout.addWidget(self._section_label("TOOLS"))
-        for kind, label in TOOLS:
-            self._add_nav_button(layout, kind, label)
+        for kind, label, icon in TOOLS:
+            btn = self._add_nav_button(layout, kind, label, icon)
+            if kind == "tags":
+                btn.clicked.connect(self.tagsRequested.emit)
 
         layout.addStretch(1)
 
-    def _section_label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("sidebarSection")
-        return label
-
-    def _add_nav_button(self, layout: QVBoxLayout, kind: str, label_text: str):
-        btn = QPushButton(label_text)
-        btn.setObjectName("sidebarNav")
+    def _add_nav_button(self, layout: QVBoxLayout, kind: str, label_text: str, icon: str) -> QPushButton:
+        btn = QPushButton(icon)
+        btn.setObjectName("railNav")
+        btn.setToolTip(label_text)
         btn.setCheckable(True)
+        btn.setFixedSize(52, 48)
         btn.clicked.connect(lambda: self.select(kind))
         layout.addWidget(btn)
         self._nav_buttons[kind] = btn
-
-    def _on_playlist_clicked(self, item: QListWidgetItem):
-        for btn in self._nav_buttons.values():
-            btn.setChecked(False)
-        playlist_id = item.data(Qt.ItemDataRole.UserRole)
-        self.navigate.emit("playlist", (playlist_id, item.text()))
+        return btn
 
     def select(self, kind: str):
-        """Programmatic navigation (e.g. from the Split module's "send to Tags"
-        shortcut) — mirrors a click on the given nav button, kept in sync
-        visually with whatever's actually showing."""
+        """Programmatic navigation (e.g. Fix Tags, Send Segments to Tags,
+        Merge's "then split") — mirrors a click on the given rail button."""
         if kind not in self._nav_buttons:
             return
-        self.playlist_list.clearSelection()
         for k, btn in self._nav_buttons.items():
             btn.setChecked(k == kind)
         self.navigate.emit(kind, None)
 
+    def deselect_all(self):
+        """Called when a playlist (owned by the separate PlaylistDeck) is
+        selected instead, so a rail button doesn't stay lit for a page
+        that's no longer showing."""
+        for btn in self._nav_buttons.values():
+            btn.setChecked(False)
+
+
+class PlaylistDeck(QWidget):
+    """Emits navigate("playlist", (playlist_id, name)) on selection,
+    createRequested when the "+" button is clicked, and renameRequested when
+    a double-click-to-edit finishes. This widget never touches the database
+    itself — MainWindow owns that, same separation as everywhere else."""
+
+    navigate = pyqtSignal(str, object)
+    createRequested = pyqtSignal()
+    renameRequested = pyqtSignal(int, str)
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("playlistDeck")
+        self.setFixedWidth(210)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 10, 4, 10)
+        layout.setSpacing(4)
+
+        header_row = QHBoxLayout()
+        header = QLabel("PLAYLISTS")
+        header.setObjectName("sidebarSection")
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+        add_btn = QPushButton("+")
+        add_btn.setFixedSize(20, 20)
+        add_btn.setToolTip("New playlist")
+        add_btn.clicked.connect(self.createRequested.emit)
+        header_row.addWidget(add_btn)
+        layout.addLayout(header_row)
+
+        self.playlist_list = QListWidget()
+        self.playlist_list.setObjectName("sidebarList")
+        self.playlist_list.itemClicked.connect(self._on_playlist_clicked)
+        self.playlist_list.itemChanged.connect(self._on_playlist_renamed)
+        # No fixed/capped height here, deliberately — the list fills whatever
+        # vertical space the deck column has and scrolls on its own past
+        # that. A second, outer scroll region on top of this is exactly the
+        # double-scrollbar bug this widget replaces.
+        layout.addWidget(self.playlist_list, stretch=1)
+
+    def _on_playlist_clicked(self, item: QListWidgetItem):
+        playlist_id = item.data(Qt.ItemDataRole.UserRole)
+        self.navigate.emit("playlist", (playlist_id, item.text()))
+
+    def _on_playlist_renamed(self, item: QListWidgetItem):
+        new_name = item.text().strip()
+        if not new_name:
+            return
+        playlist_id = item.data(Qt.ItemDataRole.UserRole)
+        self.renameRequested.emit(playlist_id, new_name)
+
     def set_playlists(self, playlists: list[tuple[int, str]]):
         """playlists: list of (playlist_id, name), in display order."""
+        self.playlist_list.blockSignals(True)  # rebuilding the list is not a user rename
         self.playlist_list.clear()
         for playlist_id, name in playlists:
             item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             item.setData(Qt.ItemDataRole.UserRole, playlist_id)
             self.playlist_list.addItem(item)
-        self._resize_playlist_list()
+        self.playlist_list.blockSignals(False)
 
-    def _resize_playlist_list(self):
-        """No static height — collapses to nothing when there are no playlists
-        (instead of leaving a dead gap), then grows to fit as playlists are
-        added, up to PLAYLIST_MAX_VISIBLE_ROWS, beyond which it scrolls
-        normally rather than growing further."""
-        count = self.playlist_list.count()
-        has_playlists = count > 0
-        self._playlists_label.setVisible(has_playlists)
-        self.playlist_list.setVisible(has_playlists)
-        if not has_playlists:
-            return
-        row_height = self.playlist_list.sizeHintForRow(0)
-        visible_rows = min(count, PLAYLIST_MAX_VISIBLE_ROWS)
-        frame = 2 * self.playlist_list.frameWidth()
-        self.playlist_list.setFixedHeight(visible_rows * row_height + frame + 4)
+    def clear_selection(self):
+        """Called when a rail button (owned by the separate ToolRail) is
+        selected instead, so no playlist stays highlighted for a page that's
+        no longer showing."""
+        self.playlist_list.clearSelection()
