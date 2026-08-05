@@ -31,10 +31,18 @@ from PyQt6.QtWidgets import (
 )
 
 from .library import db as libdb
-from .library.export import ExportItem, ExportReport, ExportWorker, list_audiobook_entries
+from .library.export import (
+    CopyReport,
+    CopyTracksWorker,
+    ExportItem,
+    ExportReport,
+    ExportWorker,
+    list_audiobook_entries,
+)
 from .library.migrate import LibraryBuildWorker, LibraryScanWorker, MusicSource
 from .library.playlists import write_m3u8
-from .widgets import LevelGauge
+from .styles import INK, MUTED, ORANGE
+from .widgets import ChamferedFrame, LevelGauge, PixelLabel
 from .workers import sanitize_filename
 
 
@@ -85,7 +93,7 @@ def make_track_table() -> QTableWidget:
     table.setHorizontalHeaderLabels(["Title", "Artist", "In"])
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     table.setSortingEnabled(True)
     table.verticalHeader().setVisible(False)
     header = table.horizontalHeader()
@@ -99,10 +107,23 @@ def populate_track_table(table: QTableWidget, tracks, membership: dict):
     table.setSortingEnabled(False)
     table.setRowCount(len(tracks))
     for row, t in enumerate(tracks):
-        table.setItem(row, 0, _readonly_item(t["title"] or Path(t["library_path"]).stem))
+        title_item = _readonly_item(t["title"] or Path(t["library_path"]).stem)
+        title_item.setData(Qt.ItemDataRole.UserRole, {"id": t["id"], "library_path": t["library_path"]})
+        table.setItem(row, 0, title_item)
         table.setItem(row, 1, _readonly_item(t["artist"] or ""))
         table.setItem(row, 2, _NumericItem(membership.get(t["id"], 0)))
     table.setSortingEnabled(True)
+
+
+def selected_library_paths(table: QTableWidget) -> list[str]:
+    """library_path for each fully-selected row, in visual (possibly sorted)
+    order — used by "COPY SELECTED..." on the Songs/Audiobooks tabs."""
+    paths = []
+    for index in table.selectionModel().selectedRows(0):
+        data = table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+        if data:
+            paths.append(data["library_path"])
+    return paths
 
 
 class LibraryMigrationDialog(QDialog):
@@ -486,6 +507,90 @@ class ExportDialog(QDialog):
         self.report_label.setText("Export cancelled — items already copied before cancelling are kept.")
 
 
+class CopyTracksDialog(QDialog):
+    """Ad-hoc copy of whatever tracks were multi-selected in the Songs/
+    Audiobooks table into a folder the user picks — flat, no per-item
+    subfolder (that's what the full Export dialog is for)."""
+
+    def __init__(self, parent, library_root: str, library_paths: list[str]):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.library_paths = library_paths
+        self.setWindowTitle(f"Copy {len(library_paths)} Track(s)")
+        self.resize(480, 380)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(f"Copying {len(library_paths)} track(s) as flat files into a folder you choose.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        dest_row = QHBoxLayout()
+        self.dest_edit = QLineEdit()
+        self.dest_edit.setReadOnly(True)
+        dest_btn = QPushButton("CHOOSE...")
+        dest_btn.clicked.connect(self._choose_destination)
+        dest_row.addWidget(self.dest_edit, stretch=1)
+        dest_row.addWidget(dest_btn)
+        layout.addLayout(dest_row)
+
+        action_row = QHBoxLayout()
+        self.copy_btn = QPushButton("COPY")
+        self.copy_btn.setObjectName("primary")
+        self.copy_btn.clicked.connect(self._run_copy)
+        action_row.addWidget(self.copy_btn)
+        layout.addLayout(action_row)
+
+        self.gauge = LevelGauge()
+        layout.addWidget(self.gauge)
+
+        self.report_label = QLabel("")
+        self.report_label.setObjectName("muted")
+        self.report_label.setWordWrap(True)
+        layout.addWidget(self.report_label)
+
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("CLOSE")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def _choose_destination(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Choose destination folder", str(Path.home()))
+        if chosen:
+            self.dest_edit.setText(chosen)
+
+    def _log(self, msg: str):
+        self.log_box.appendPlainText(msg)
+
+    def _run_copy(self):
+        destination = self.dest_edit.text().strip()
+        if not destination or not Path(destination).exists():
+            QMessageBox.warning(self, "No destination", "Choose a destination folder first.")
+            return
+        self.copy_btn.setEnabled(False)
+        self.gauge.set_idle()
+        self.report_label.setText("")
+        self._worker = CopyTracksWorker(self.library_root, self.library_paths, destination)
+        self._worker.log.connect(self._log)
+        self._worker.progress.connect(self.gauge.set_progress)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.start()
+
+    def _on_done(self, report: CopyReport):
+        self.gauge.set_done("COPY COMPLETE")
+        self.copy_btn.setEnabled(True)
+        text = f"{report.copied_count} copied, {report.failed_count} failed."
+        if report.failed_count:
+            text += " See the log below for detail."
+        self.report_label.setText(text)
+
+
 class LibraryView(QWidget):
     """The app's home screen. get_library_root/set_library_root let this view
     share the persisted library location with MainWindow without owning
@@ -517,6 +622,16 @@ class LibraryView(QWidget):
         self.location_btn.clicked.connect(self._change_library_location)
         layout.addWidget(self.location_btn)
         self._refresh_location_label()
+
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(10)
+        self.stat_songs_value = QLabel("0")
+        self.stat_dupes_value = QLabel("0")
+        self.stat_audiobooks_value = QLabel("0")
+        stats_row.addWidget(self._make_stat_card("SONGS", self.stat_songs_value, MUTED))
+        stats_row.addWidget(self._make_stat_card("DUPLICATES", self.stat_dupes_value, ORANGE))
+        stats_row.addWidget(self._make_stat_card("AUDIOBOOKS", self.stat_audiobooks_value, MUTED))
+        layout.addLayout(stats_row)
 
         top_row = QHBoxLayout()
         self.search_edit = QLineEdit()
@@ -550,6 +665,15 @@ class LibraryView(QWidget):
         self.sub_tabs.addTab(self.unsorted_list, "UNSORTED")
         layout.addWidget(self.sub_tabs, stretch=1)
 
+        self.copy_actions = QWidget()
+        copy_row = QHBoxLayout(self.copy_actions)
+        copy_row.setContentsMargins(0, 0, 0, 0)
+        copy_row.addStretch(1)
+        copy_selected_btn = QPushButton("COPY SELECTED...")
+        copy_selected_btn.clicked.connect(self._copy_selected_tracks)
+        copy_row.addWidget(copy_selected_btn)
+        layout.addWidget(self.copy_actions)
+
         self.dupe_actions = QWidget()
         dupe_row = QHBoxLayout(self.dupe_actions)
         dupe_row.setContentsMargins(0, 0, 0, 0)
@@ -578,7 +702,18 @@ class LibraryView(QWidget):
 
         self.refresh()
 
+    def _make_stat_card(self, label_text: str, value_label: QLabel, label_color: str) -> ChamferedFrame:
+        frame = ChamferedFrame(chamfer=12)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(14, 12, 14, 12)
+        inner.setSpacing(8)
+        inner.addWidget(PixelLabel(label_text, font_size=7, scale=2.2, color=label_color, letter_spacing=2))
+        value_label.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {INK};")
+        inner.addWidget(value_label)
+        return frame
+
     def _update_sub_tab_actions(self, index: int):
+        self.copy_actions.setVisible(index in (0, 1))  # SONGS, AUDIOBOOKS
         self.dupe_actions.setVisible(index == 2)  # DUPLICATES
         self.unsorted_actions.setVisible(index == 3)  # UNSORTED
 
@@ -653,6 +788,9 @@ class LibraryView(QWidget):
         self.empty_hint.setText(
             "" if (music_tracks or audiobook_tracks) else "No library yet — click ADD SOURCES to get started."
         )
+        self.stat_songs_value.setText(str(len(music_tracks)))
+        self.stat_dupes_value.setText(str(len(dupes)))
+        self.stat_audiobooks_value.setText(str(len(audiobook_tracks)))
         conn.close()
         self.libraryChanged.emit()
 
@@ -696,8 +834,22 @@ class LibraryView(QWidget):
         self.duplicates_list.clear()
         self.unsorted_list.clear()
         self.sub_tabs.setTabText(3, "UNSORTED (0)")
+        self.stat_songs_value.setText("0")
+        self.stat_dupes_value.setText("0")
+        self.stat_audiobooks_value.setText("0")
 
     # ---- actions ----
+
+    def _copy_selected_tracks(self):
+        table = self.songs_table if self.sub_tabs.currentIndex() == 0 else self.audiobooks_table
+        paths = selected_library_paths(table)
+        if not paths:
+            QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
+            return
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        CopyTracksDialog(self, library_root, paths).exec()
 
     def _dismiss_selected_dupe(self):
         item = self.duplicates_list.currentItem()
@@ -815,8 +967,11 @@ class PlaylistView(QWidget):
         add_btn.clicked.connect(self._open_add_tracks_dialog)
         remove_btn = QPushButton("REMOVE SELECTED")
         remove_btn.clicked.connect(self._remove_selected)
+        copy_btn = QPushButton("COPY SELECTED...")
+        copy_btn.clicked.connect(self._copy_selected)
         top_row.addWidget(add_btn)
         top_row.addWidget(remove_btn)
+        top_row.addWidget(copy_btn)
         top_row.addStretch(1)
         export_btn = QPushButton("EXPORT...")
         export_btn.clicked.connect(self._open_export_dialog)
@@ -861,7 +1016,7 @@ class PlaylistView(QWidget):
             row = conn.execute("SELECT * FROM tracks WHERE library_path = ?", (path,)).fetchone()
             if row:
                 item = QListWidgetItem(f"{row['title'] or Path(path).stem}  —  {row['artist'] or ''}")
-                item.setData(Qt.ItemDataRole.UserRole, row["id"])
+                item.setData(Qt.ItemDataRole.UserRole, {"id": row["id"], "library_path": path})
                 self.track_list.addItem(item)
         conn.close()
 
@@ -875,7 +1030,7 @@ class PlaylistView(QWidget):
         library_root = self._library_root_or_none()
         if not library_root or self._playlist_id is None:
             return
-        track_ids = [self.track_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.track_list.count())]
+        track_ids = [self.track_list.item(i).data(Qt.ItemDataRole.UserRole)["id"] for i in range(self.track_list.count())]
         conn = libdb.open_db(library_root)
         libdb.reorder_playlist_tracks(conn, self._playlist_id, track_ids)
         conn.close()
@@ -892,11 +1047,22 @@ class PlaylistView(QWidget):
             return
         conn = libdb.open_db(library_root)
         for item in items:
-            libdb.remove_playlist_track(conn, self._playlist_id, item.data(Qt.ItemDataRole.UserRole))
+            libdb.remove_playlist_track(conn, self._playlist_id, item.data(Qt.ItemDataRole.UserRole)["id"])
         conn.close()
         self._write_current_m3u8(library_root)
         self.refresh()
         self.playlistsChanged.emit()
+
+    def _copy_selected(self):
+        items = self.track_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        paths = [item.data(Qt.ItemDataRole.UserRole)["library_path"] for item in items]
+        CopyTracksDialog(self, library_root, paths).exec()
 
     def _open_add_tracks_dialog(self):
         if self._playlist_id is None:

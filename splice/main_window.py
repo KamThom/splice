@@ -37,8 +37,8 @@ from . import tagging
 from .library import db as libdb
 from .library_view import LibraryView, PlaylistView
 from .sidebar import PlaylistDeck, ToolRail
-from .styles import STYLESHEET
-from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, SplitDropZone, StatusDot
+from .styles import ORANGE, STYLESHEET
+from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, PixelLabel, SplitDropZone, StatusDot
 from .workers import (
     FFMPEG,
     FFMPEG_INSTALL_HINT,
@@ -302,8 +302,7 @@ class MainWindow(QMainWindow):
         top_row = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        title = QLabel("SPLICE")
-        title.setObjectName("appTitle")
+        title = PixelLabel("SPLICE", font_size=11, scale=3, color=ORANGE, letter_spacing=2)
         subtitle = QLabel("AUDIO SPLICING UNIT // MK.III")
         subtitle.setObjectName("appSubtitle")
         title_col.addWidget(title)

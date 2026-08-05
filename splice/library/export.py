@@ -10,7 +10,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..widgets import natural_sort_key
-from ..workers import sanitize_filename
+from ..workers import sanitize_filename, unique_path
 from . import db as libdb
 
 
@@ -30,6 +30,63 @@ class ExportReport:
     skipped_files: list = field(default_factory=list)
     failed_count: int = 0
     failed_files: list = field(default_factory=list)  # (filename, error) tuples
+
+
+@dataclass
+class CopyReport:
+    copied_count: int = 0
+    failed_count: int = 0
+    failed_files: list = field(default_factory=list)  # (filename, reason) tuples
+
+
+class CopyTracksWorker(QThread):
+    """Ad-hoc copy of arbitrary selected tracks straight into a destination
+    folder, flat (no per-item subfolder) — unlike ExportWorker, which is for
+    whole playlists/audiobook entries and gives each its own subfolder. This
+    is for "just these few songs, right into this one folder."."""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(object)  # CopyReport
+    cancelled = pyqtSignal()
+
+    def __init__(self, library_root: str, library_paths: list[str], destination: str):
+        super().__init__()
+        self.library_root = library_root
+        self.library_paths = library_paths
+        self.destination = destination
+        self._cancel_requested = False
+        self.report = CopyReport()
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def run(self):
+        total = len(self.library_paths)
+        self.log.emit(f"Copying {total} track(s)...")
+        for i, rel_path in enumerate(self.library_paths, start=1):
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+            self.progress.emit(int(i / total * 100) if total else 100)
+
+            src = Path(self.library_root) / rel_path
+            if not src.exists():
+                self.report.failed_count += 1
+                self.report.failed_files.append((rel_path, "missing from library"))
+                self.log.emit(f"  Missing: {rel_path}")
+                continue
+            try:
+                dest = unique_path(Path(self.destination) / src.name)
+                shutil.copy2(src, dest)
+                self.report.copied_count += 1
+            except Exception as e:
+                self.report.failed_count += 1
+                self.report.failed_files.append((src.name, str(e)))
+                self.log.emit(f"  FAILED {src.name}: {e}")
+
+        self.log.emit(f"Copy complete: {self.report.copied_count} copied, {self.report.failed_count} failed.")
+        self.finished_ok.emit(self.report)
 
 
 def list_audiobook_entries(library_root: str) -> list[tuple[str, str]]:

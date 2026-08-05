@@ -4,10 +4,22 @@ import re
 from pathlib import Path
 
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QMouseEvent, QPainter, QPixmap
+from PyQt6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QFontMetrics,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
+    QFrame,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -15,7 +27,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .styles import BORDER, CONSOLE, GREEN, INK, MUTED, ORANGE, RED, TEAL
+from .styles import BORDER, CONSOLE, GREEN, INK, MUTED, ORANGE, RED, SURFACE
 
 
 def extract_dropped_mp3s(event) -> list[str]:
@@ -192,7 +204,7 @@ class DropListWidget(QListWidget):
             f"QListWidget {{ border: 2px dashed {border_color}; border-radius: 12px; "
             f"background-color: {CONSOLE}; color: {INK}; padding: 4px; }}"
             f"QListWidget::item {{ padding: 4px 6px; border-radius: 4px; }}"
-            f"QListWidget::item:selected {{ background-color: {TEAL}; color: {CONSOLE}; }}"
+            f"QListWidget::item:selected {{ background-color: {ORANGE}; color: #FFFFFF; }}"
         )
 
     def _set_idle_style(self):
@@ -379,3 +391,102 @@ class CoverArtThumbnail(QLabel):
         self._pixmap = None
         self.setPixmap(QPixmap())
         self.setText(self.PLACEHOLDER_TEXT)
+
+
+def render_pixel_text(text: str, font_size: int = 8, scale: int = 3, color: str = INK,
+                       weight=QFont.Weight.Bold, letter_spacing: int = 1) -> QPixmap:
+    """Draws text at a tiny font size onto an offscreen pixmap, then scales it
+    up with nearest-neighbor filtering — Qt has no bitmap pixel font built
+    in and this app can't fetch one over the network, so "draw small, blow
+    up crisp" is the same trick used for pixel-art web text."""
+    font = QFont("Menlo")
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    font.setPixelSize(font_size)
+    font.setWeight(weight)
+    metrics = QFontMetrics(font)
+
+    width = sum(metrics.horizontalAdvance(ch) + letter_spacing for ch in text)
+    height = metrics.height()
+
+    small = QPixmap(max(1, width), max(1, height))
+    small.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(small)
+    painter.setFont(font)
+    painter.setPen(QColor(color))
+    x = 0
+    for ch in text:
+        painter.drawText(x, metrics.ascent(), ch)
+        x += metrics.horizontalAdvance(ch) + letter_spacing
+    painter.end()
+
+    return small.scaled(
+        int(round(small.width() * scale)), int(round(small.height() * scale)),
+        Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation,
+    )
+
+
+class PixelLabel(QLabel):
+    """A QLabel whose text renders as blocky pixel type (see
+    render_pixel_text). Reserved for chrome/branding — actual data (track
+    titles, artist names, ...) stays in the app's normal monospace so it's
+    legible, never pixelated."""
+
+    def __init__(self, text: str = "", font_size: int = 8, scale: int = 3,
+                 color: str = INK, letter_spacing: int = 1):
+        super().__init__()
+        self._font_size = font_size
+        self._scale = scale
+        self._color = color
+        self._letter_spacing = letter_spacing
+        if text:
+            self.set_text(text)
+
+    def set_text(self, text: str):
+        pixmap = render_pixel_text(
+            text, font_size=self._font_size, scale=self._scale,
+            color=self._color, letter_spacing=self._letter_spacing,
+        )
+        self.setPixmap(pixmap)
+        self.setFixedSize(pixmap.size())
+
+
+class ChamferedFrame(QFrame):
+    """A panel with one corner cut at 45°, matching Direction E's stat-card
+    shape language — QSS border-radius can't do an asymmetric single-corner
+    cut, so this paints its own background+border via QPainterPath, the
+    same custom-paint pattern LevelGauge uses above."""
+
+    def __init__(self, chamfer: int = 14, corner: str = "bottom-left",
+                 background: str = SURFACE, border: str = BORDER):
+        super().__init__()
+        self._chamfer = chamfer
+        self._corner = corner
+        self._background = QColor(background)
+        self._border = QColor(border)
+
+    def _path(self) -> QPainterPath:
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        c = self._chamfer
+        path = QPainterPath()
+        if self._corner == "bottom-left":
+            path.moveTo(r.left(), r.top())
+            path.lineTo(r.right(), r.top())
+            path.lineTo(r.right(), r.bottom())
+            path.lineTo(r.left() + c, r.bottom())
+            path.lineTo(r.left(), r.bottom() - c)
+            path.closeSubpath()
+        else:  # "top-left"
+            path.moveTo(r.left(), r.top() + c)
+            path.lineTo(r.left() + c, r.top())
+            path.lineTo(r.right(), r.top())
+            path.lineTo(r.right(), r.bottom())
+            path.lineTo(r.left(), r.bottom())
+            path.closeSubpath()
+        return path
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self._border, 1))
+        painter.setBrush(self._background)
+        painter.drawPath(self._path())

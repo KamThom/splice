@@ -1,21 +1,22 @@
 """Palette constants and the app-wide Qt stylesheet."""
 
-# --- "Odyssey" retro-futurism palette — warm, rounded, analog-console feel ---
-# (deliberately distinct from the wiki's Field Dossier brand colors)
-BG = "#43403A"          # warm taupe chassis, lighter than a typical dark theme
-SURFACE = "#57534B"      # panel surface, one step up from chassis
-RAIL_SURFACE = "#69655D"  # tool rail — a step lighter than SURFACE so it reads clearly against the chassis
-CONSOLE = "#2B2924"      # CRT-readout well — stays dark on purpose for phosphor contrast
-INK = "#F6EFDD"          # warm cream text
-MUTED = "#C9C0AC"        # muted cream for secondary text
-BORDER = "#7A7568"       # soft warm border, no hard black edges
-ORANGE = "#FF7A33"       # primary accent — hazard-tape orange, warmed up
-TEAL = "#3FB8A6"         # secondary accent — retro console teal
-GREEN = "#8FD19E"        # success — soft phosphor green, not neon
-RED = "#E0664F"          # error — warm rust red
+# --- Direction E — grey/pixel HUD, built from the user's own moodboard ---
+# Light grey chassis + white panels (pulled from the lightest reference on
+# the board, a white technical schematic sheet) with a single vivid
+# red-orange accent doing double duty as "primary action" and "active/
+# selected" everywhere — deliberately one accent hue, not two.
+BG = "#E7E8EA"           # light grey chassis
+SURFACE = "#FFFFFF"       # panel surface — also used for the rail/deck, no separate tone needed
+CONSOLE = "#E7E8EA"      # input/log "well" — same as chassis, reads as recessed against white panels
+INK = "#1C1E22"          # near-black text
+MUTED = "#5E636A"        # mid grey for secondary text
+BORDER = "#CBCED3"       # soft grey border
+ORANGE = "#FF4F30"       # primary + active/selected accent
+GREEN = "#1E9E63"        # success — deepened for legibility on a light background
+RED = "#D93A2B"          # true error state — distinct from the accent
 
-RADIUS = 10
-RADIUS_SM = 7
+RADIUS = 3
+RADIUS_SM = 2
 
 STYLESHEET = f"""
 QMainWindow, QWidget {{
@@ -33,7 +34,7 @@ QLabel {{
     background: transparent;
 }}
 QLabel#panelTitle {{
-    color: {TEAL};
+    color: {INK};
     font-weight: bold;
     font-size: 13px;
     letter-spacing: 1px;
@@ -53,13 +54,12 @@ QLabel#muted {{
     color: {MUTED};
 }}
 QFrame#rule {{
-    background-color: {TEAL};
-    max-height: 3px;
-    min-height: 3px;
-    border-radius: 1px;
+    background-color: {BORDER};
+    max-height: 1px;
+    min-height: 1px;
 }}
 QPushButton {{
-    background-color: {BG};
+    background-color: {SURFACE};
     color: {INK};
     border: 1px solid {BORDER};
     border-radius: {RADIUS_SM}px;
@@ -75,13 +75,13 @@ QPushButton:disabled {{
 }}
 QPushButton#primary {{
     background-color: {ORANGE};
-    color: {CONSOLE};
+    color: #FFFFFF;
     font-weight: bold;
     border: none;
     border-radius: {RADIUS_SM}px;
 }}
 QPushButton#primary:hover {{
-    background-color: #FF9459;
+    background-color: #FF7156;
 }}
 QPushButton#primary:disabled {{
     background-color: {BORDER};
@@ -96,14 +96,14 @@ QPushButton#outputBar {{
     padding: 11px 16px;
 }}
 QPushButton#outputBar:hover {{
-    border-color: {TEAL};
+    border-color: {ORANGE};
     color: {INK};
 }}
 QPlainTextEdit {{
     background-color: {CONSOLE};
     border: 1px solid {BORDER};
     border-radius: {RADIUS_SM}px;
-    color: {GREEN};
+    color: {INK};
     padding: 6px;
 }}
 QDoubleSpinBox {{
@@ -166,8 +166,8 @@ QListWidget#filePicker::item {{
     border-radius: 4px;
 }}
 QListWidget#filePicker::item:selected {{
-    background-color: {TEAL};
-    color: {CONSOLE};
+    background-color: {ORANGE};
+    color: #FFFFFF;
 }}
 QLabel#coverArt {{
     border: 1px solid {BORDER};
@@ -176,7 +176,7 @@ QLabel#coverArt {{
     color: {MUTED};
 }}
 QWidget#toolRail {{
-    background-color: {RAIL_SURFACE};
+    background-color: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: {RADIUS}px;
 }}
@@ -184,23 +184,6 @@ QWidget#playlistDeck {{
     background-color: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: {RADIUS}px;
-}}
-QPushButton#railNav {{
-    background-color: transparent;
-    color: {MUTED};
-    border: none;
-    border-radius: {RADIUS_SM}px;
-    font-size: 20px;
-}}
-QPushButton#railNav:hover {{
-    background-color: {BG};
-    color: {ORANGE};
-}}
-QPushButton#railNav:checked {{
-    background-color: {BG};
-    color: {ORANGE};
-    font-weight: bold;
-    border-left: 3px solid {ORANGE};
 }}
 QLabel#sidebarSection {{
     color: {MUTED};

@@ -133,16 +133,18 @@ def file_single_track(library_root: str, source_path: str, kind: str = "music") 
         shutil.copy2(source_path, dest_abs)
         library_path = dest_abs.relative_to(library_root).as_posix()
 
+        # Look up fuzzy matches BEFORE inserting — otherwise the just-inserted
+        # row matches its own title+artist and every track ends up flagged as
+        # a duplicate of itself.
+        fuzzy_matches = libdb.find_by_normalized_title_artist(conn, scanned.title, scanned.artist) if kind == "music" else []
         track_id = libdb.insert_track(
             conn, file_hash=scanned.hash, library_path=library_path, kind=kind,
             title=scanned.title, artist=scanned.artist, album=scanned.album,
             date=scanned.date, tracknumber=scanned.tracknumber,
             duration_seconds=scanned.duration_seconds,
         )
-        if kind == "music":
-            fuzzy_matches = libdb.find_by_normalized_title_artist(conn, scanned.title, scanned.artist)
-            for match in fuzzy_matches:
-                libdb.add_fuzzy_dupe(conn, track_id, match["id"], "same normalized title+artist")
+        for match in fuzzy_matches:
+            libdb.add_fuzzy_dupe(conn, track_id, match["id"], "same normalized title+artist")
         return track_id, "added"
     finally:
         conn.close()

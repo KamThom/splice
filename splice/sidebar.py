@@ -1,14 +1,81 @@
-"""Left-hand navigation, split into two independent widgets: a slim icon-only
-ToolRail (Library home + Merge/Split/YouTube/Tags) and a full-height
-PlaylistDeck. Splitting them (rather than one long stacked sidebar) is what
-lets Playlists get its own single-scrollbar column instead of a capped,
-double-scrolling section fighting the tools list for space."""
+"""Left-hand navigation, split into two independent widgets: a slim
+text-rail ToolRail (Library home + Merge/Split/YouTube/Tags) and a
+full-height PlaylistDeck. Splitting them (rather than one long stacked
+sidebar) is what lets Playlists get its own single-scrollbar column instead
+of a capped, double-scrolling section fighting the tools list for space."""
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
-# (kind, tooltip label, icon glyph)
-TOOLS = [("merge", "MERGE", "▤"), ("split", "SPLIT", "✂"), ("youtube", "YOUTUBE", "▾"), ("tags", "TAGS", "#")]
+from .styles import BG, BORDER, MUTED, ORANGE
+from .widgets import PixelLabel, render_pixel_text
+
+TOOLS = [("merge", "MERGE"), ("split", "SPLIT"), ("youtube", "YOUTUBE"), ("tags", "TAGS")]
+
+
+class RailButton(QAbstractButton):
+    """One rail item: a checkable button whose label renders as vertical,
+    rotated, blocky pixel text. QSS can't rotate text or fake a pixel font,
+    so this paints itself directly via QPainter — same custom-paint idiom
+    as LevelGauge/ChamferedFrame in widgets.py. Subclasses QAbstractButton
+    rather than QWidget specifically to get checkable/clicked/setChecked/
+    isChecked for free, so ToolRail's select() logic barely changes."""
+
+    def __init__(self, label: str):
+        super().__init__()
+        self._label = label
+        self._hover = False
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+    def sizeHint(self) -> QSize:
+        return QSize(38, 90)
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+
+        if self.isChecked():
+            tint = QColor(ORANGE)
+            tint.setAlpha(28)
+            painter.fillRect(rect, tint)
+            painter.setPen(QPen(QColor(ORANGE), 2))
+            painter.drawLine(rect.left() + 1, rect.top(), rect.left() + 1, rect.bottom())
+        elif self._hover:
+            painter.fillRect(rect, QColor(BG))
+
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+
+        color = ORANGE if self.isChecked() else MUTED
+        pixmap = render_pixel_text(self._label, font_size=7, scale=2, color=color, letter_spacing=3)
+        painter.save()
+        painter.translate(rect.center())
+        painter.rotate(90)
+        painter.drawPixmap(-pixmap.width() // 2, -pixmap.height() // 2, pixmap)
+        painter.restore()
 
 
 class ToolRail(QWidget):
@@ -26,28 +93,21 @@ class ToolRail(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("toolRail")
-        self.setFixedWidth(72)
+        self.setFixedWidth(38)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 14, 8, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self._nav_buttons: dict[str, QPushButton] = {}
+        self._nav_buttons: dict[str, RailButton] = {}
 
-        self._add_nav_button(layout, "library", "LIBRARY", "◆")
-        layout.addSpacing(10)
-        for kind, label, icon in TOOLS:
-            btn = self._add_nav_button(layout, kind, label, icon)
+        self._add_nav_button(layout, "library", "LIBRARY")
+        for kind, label in TOOLS:
+            btn = self._add_nav_button(layout, kind, label)
             if kind == "tags":
                 btn.clicked.connect(self.tagsRequested.emit)
 
-        layout.addStretch(1)
-
-    def _add_nav_button(self, layout: QVBoxLayout, kind: str, label_text: str, icon: str) -> QPushButton:
-        btn = QPushButton(icon)
-        btn.setObjectName("railNav")
-        btn.setToolTip(label_text)
-        btn.setCheckable(True)
-        btn.setFixedSize(52, 48)
+    def _add_nav_button(self, layout: QVBoxLayout, kind: str, label_text: str) -> RailButton:
+        btn = RailButton(label_text)
         btn.clicked.connect(lambda: self.select(kind))
         layout.addWidget(btn)
         self._nav_buttons[kind] = btn
@@ -89,8 +149,7 @@ class PlaylistDeck(QWidget):
         layout.setSpacing(4)
 
         header_row = QHBoxLayout()
-        header = QLabel("PLAYLISTS")
-        header.setObjectName("sidebarSection")
+        header = PixelLabel("PLAYLISTS", font_size=7, scale=2.2, color=MUTED, letter_spacing=2)
         header_row.addWidget(header)
         header_row.addStretch(1)
         add_btn = QPushButton("+")
