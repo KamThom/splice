@@ -4,8 +4,8 @@ full-height PlaylistDeck. Splitting them (rather than one long stacked
 sidebar) is what lets Playlists get its own single-scrollbar column instead
 of a capped, double-scrolling section fighting the tools list for space."""
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QHBoxLayout,
@@ -17,19 +17,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .styles import BG, BORDER, MUTED, ORANGE
-from .widgets import PixelLabel, render_pixel_text
+from .styles import BG, BORDER, MUTED, ORANGE, PIXEL_FONT_FAMILY
+from .widgets import PixelLabel
 
 TOOLS = [("merge", "MERGE"), ("split", "SPLIT"), ("youtube", "YOUTUBE"), ("tags", "TAGS")]
 
 
 class RailButton(QAbstractButton):
     """One rail item: a checkable button whose label renders as vertical,
-    rotated, blocky pixel text. QSS can't rotate text or fake a pixel font,
-    so this paints itself directly via QPainter — same custom-paint idiom
-    as LevelGauge/ChamferedFrame in widgets.py. Subclasses QAbstractButton
-    rather than QWidget specifically to get checkable/clicked/setChecked/
-    isChecked for free, so ToolRail's select() logic barely changes."""
+    rotated text in the bundled Silkscreen pixel font. QSS can't rotate
+    text, so this paints itself directly via QPainter — same custom-paint
+    idiom as LevelGauge/ChamferedFrame in widgets.py. Subclasses
+    QAbstractButton rather than QWidget specifically to get checkable/
+    clicked/setChecked/isChecked for free, so ToolRail's select() logic
+    barely changes."""
 
     def __init__(self, label: str):
         super().__init__()
@@ -70,11 +71,21 @@ class RailButton(QAbstractButton):
         painter.drawLine(rect.bottomLeft(), rect.bottomRight())
 
         color = ORANGE if self.isChecked() else MUTED
-        pixmap = render_pixel_text(self._label, font_size=7, scale=2, color=color, letter_spacing=3)
+        font = QFont(PIXEL_FONT_FAMILY)
+        font.setPointSize(11)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
+        painter.setFont(font)
+        painter.setPen(QColor(color))
+
         painter.save()
         painter.translate(rect.center())
         painter.rotate(90)
-        painter.drawPixmap(-pixmap.width() // 2, -pixmap.height() // 2, pixmap)
+        # After rotating 90°, the painter's local x-axis runs along the
+        # rail's height and local y along its (negative) width — draw into
+        # a rect matching that, centered on the origin.
+        text_rect = QRect(-rect.height() // 2, -rect.width() // 2, rect.height(), rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self._label)
         painter.restore()
 
 
@@ -149,7 +160,7 @@ class PlaylistDeck(QWidget):
         layout.setSpacing(4)
 
         header_row = QHBoxLayout()
-        header = PixelLabel("PLAYLISTS", font_size=7, scale=2.2, color=MUTED, letter_spacing=2)
+        header = PixelLabel("PLAYLISTS", point_size=12, color=MUTED, letter_spacing=2)
         header_row.addWidget(header)
         header_row.addStretch(1)
         add_btn = QPushButton("+")

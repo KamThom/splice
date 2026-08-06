@@ -37,7 +37,7 @@ from . import tagging
 from .library import db as libdb
 from .library_view import LibraryView, PlaylistView
 from .sidebar import PlaylistDeck, ToolRail
-from .styles import ORANGE, STYLESHEET
+from .styles import ORANGE, STYLESHEET, load_bundled_fonts
 from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, PixelLabel, SplitDropZone, StatusDot
 from .workers import (
     FFMPEG,
@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self._youtube_lookup_workers = []
         self._current_download_title = None
         self._current_download_playlist_id = None
+        self._current_download_kind = None
 
         self.setWindowTitle("Splice")
         self.resize(900, 840)
@@ -158,6 +159,7 @@ class MainWindow(QMainWindow):
         )
         self.page_playlist = PlaylistView(self._get_library_root)
         self.page_playlist.playlistsChanged.connect(self._refresh_sidebar_playlists)
+        self.page_playlist.fixTagsRequested.connect(self._fix_tags_for_path)
         self.page_merge = self._build_merge_panel()
         self.page_split = self._build_split_panel()
         self.page_youtube = self._build_youtube_panel()
@@ -205,6 +207,12 @@ class MainWindow(QMainWindow):
         idx = combo.findData(previous)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
+
+    def _on_youtube_destination_changed(self, index: int):
+        is_music = self.youtube_destination_combo.itemData(index) == "music"
+        self.youtube_playlist_combo.setEnabled(is_music)
+        if not is_music:
+            self.youtube_playlist_combo.setCurrentIndex(0)  # "No playlist (library only)" — playlists are music-only
 
     def _on_youtube_playlist_combo_changed(self, index: int):
         if self.youtube_playlist_combo.itemData(index) != "__new__":
@@ -302,7 +310,7 @@ class MainWindow(QMainWindow):
         top_row = QHBoxLayout()
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        title = PixelLabel("SPLICE", font_size=11, scale=3, color=ORANGE, letter_spacing=2)
+        title = PixelLabel("SPLICE", point_size=22, color=ORANGE, letter_spacing=2)
         subtitle = QLabel("AUDIO SPLICING UNIT // MK.III")
         subtitle.setObjectName("appSubtitle")
         title_col.addWidget(title)
@@ -452,6 +460,16 @@ class MainWindow(QMainWindow):
         self.youtube_quality_combo.setCurrentIndex(3)
         self.youtube_quality_combo.currentIndexChanged.connect(self._persist_youtube_quality)
         add_row.addWidget(self.youtube_quality_combo)
+
+        destination_label = QLabel("File as:")
+        destination_label.setObjectName("muted")
+        add_row.addWidget(destination_label)
+        self.youtube_destination_combo = QComboBox()
+        self.youtube_destination_combo.addItem("Music (library)", "music")
+        self.youtube_destination_combo.addItem("Audiobook (library)", "audiobook")
+        self.youtube_destination_combo.addItem("Output folder only", "output_only")
+        self.youtube_destination_combo.currentIndexChanged.connect(self._on_youtube_destination_changed)
+        add_row.addWidget(self.youtube_destination_combo)
 
         playlist_label = QLabel("Add to:")
         playlist_label.setObjectName("muted")
@@ -883,7 +901,8 @@ class MainWindow(QMainWindow):
         urls = [line.strip() for line in text.splitlines() if line.strip()]
         self.youtube_url_edit.clear()
         quality = self.youtube_quality_combo.currentData()
-        playlist_id = self.youtube_playlist_combo.currentData()
+        kind = self.youtube_destination_combo.currentData()
+        playlist_id = self.youtube_playlist_combo.currentData() if kind == "music" else None
         if playlist_id == "__new__":
             playlist_id = None  # shouldn't happen (combo resets after creating), but never queue with a sentinel
 
@@ -893,13 +912,13 @@ class MainWindow(QMainWindow):
                 expander = PlaylistExpandWorker(url)
                 self._youtube_lookup_workers.append(expander)
                 expander.expanded.connect(
-                    lambda results, q=quality, p=playlist_id: self._on_playlist_expanded(results, q, p)
+                    lambda results, q=quality, p=playlist_id, k=kind: self._on_playlist_expanded(results, q, p, k)
                 )
                 expander.failed.connect(self._on_playlist_expand_failed)
                 expander.finished.connect(lambda w=expander: self._forget_lookup_worker(w))
                 expander.start()
             else:
-                self._enqueue_youtube_url(url, url, quality, playlist_id)
+                self._enqueue_youtube_url(url, url, quality, playlist_id, kind)
                 lookup = TitleLookupWorker(url)
                 self._youtube_lookup_workers.append(lookup)
                 lookup.resolved.connect(self._on_title_resolved)
@@ -913,10 +932,10 @@ class MainWindow(QMainWindow):
         if worker in self._youtube_lookup_workers:
             self._youtube_lookup_workers.remove(worker)
 
-    def _on_playlist_expanded(self, results: list, quality: str, playlist_id):
+    def _on_playlist_expanded(self, results: list, quality: str, playlist_id, kind: str = "music"):
         self._write_log(f"[{ts()}]   Found {len(results)} video(s) in playlist.")
         for url, title in results:
-            self._enqueue_youtube_url(url, title, quality, playlist_id)
+            self._enqueue_youtube_url(url, title, quality, playlist_id, kind)
         self._pump_youtube_queue()
 
     def _on_playlist_expand_failed(self, err: str):
@@ -940,14 +959,15 @@ class MainWindow(QMainWindow):
             self._current_download_title = title
             self.youtube_now_label.setText(f"Downloading: {title}")
 
-    def _enqueue_youtube_url(self, url: str, title: str, quality: str, playlist_id=None):
+    def _enqueue_youtube_url(self, url: str, title: str, quality: str, playlist_id=None, kind: str = "music"):
         if self.youtube_active_worker is not None and self.youtube_active_worker.url == url:
             return
         for i in range(self.youtube_queue_list.count()):
             if self.youtube_queue_list.item(i).data(Qt.ItemDataRole.UserRole)["url"] == url:
                 return
         item = QListWidgetItem(title)
-        item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id})
+        item.setData(Qt.ItemDataRole.UserRole,
+                     {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id, "kind": kind})
         self.youtube_queue_list.addItem(item)
         self._persist_youtube_queue()
 
@@ -969,6 +989,7 @@ class MainWindow(QMainWindow):
             data = item.data(Qt.ItemDataRole.UserRole)
             self._current_download_title = data["title"]
             self._current_download_playlist_id = data.get("playlist_id")
+            self._current_download_kind = data.get("kind", "music")
             self.youtube_now_label.setText(f"Downloading: {data['title']}")
             self.youtube_progress.set_idle()
             self.youtube_worker = YouTubeWorker(data["url"], self.output_dir, data.get("quality", "192"))
@@ -982,6 +1003,7 @@ class MainWindow(QMainWindow):
         elif self.youtube_active_worker is None:
             self._current_download_title = None
             self._current_download_playlist_id = None
+            self._current_download_kind = None
             self.youtube_now_label.setText("Queue idle")
 
         self.youtube_cancel_btn.setEnabled(self.youtube_active_worker is not None)
@@ -994,27 +1016,31 @@ class MainWindow(QMainWindow):
     def _on_youtube_ok(self, out_path: str):
         self.youtube_progress.set_done("COMPLETE")
         self.youtube_active_worker = None
-        self._file_youtube_download(out_path, self._current_download_playlist_id)
+        self._file_youtube_download(out_path, self._current_download_playlist_id, self._current_download_kind or "music")
         self._pump_youtube_queue()
 
-    def _file_youtube_download(self, out_path: str, playlist_id):
-        """Files a completed download into the library (additive — the file
-        stays in the output folder either way) and, if a target playlist was
-        picked when it was queued, adds it there too. Skipped quietly if no
-        library is set up yet."""
+    def _file_youtube_download(self, out_path: str, playlist_id, kind: str = "music"):
+        """Files a completed download according to the destination chosen when
+        it was queued: into the library as music (optionally into a playlist)
+        or as an audiobook, or left as-is in the output folder with no
+        library filing at all. Music/audiobook filing is skipped quietly if
+        no library is set up yet; output-folder-only needs no library."""
+        if kind == "output_only":
+            self._write_log(f"[{ts()}] Left in output folder: {Path(out_path).name}")
+            return
         if not self.library_root:
             return
         from .library.migrate import file_single_track
         from .library.playlists import write_m3u8
 
-        track_id, status = file_single_track(self.library_root, out_path)
+        track_id, status = file_single_track(self.library_root, out_path, kind=kind)
         if track_id is None:
             self._write_log(f"[{ts()}] Could not file download into library: {status}")
             return
         if status == "added":
-            self._write_log(f"[{ts()}] Filed into library: {Path(out_path).name}")
+            self._write_log(f"[{ts()}] Filed into library ({kind}): {Path(out_path).name}")
 
-        if playlist_id is not None:
+        if kind == "music" and playlist_id is not None:
             conn = libdb.open_db(self.library_root)
             position = libdb.next_playlist_position(conn, playlist_id)
             libdb.add_playlist_track(conn, playlist_id, track_id, position)
@@ -1060,6 +1086,7 @@ class MainWindow(QMainWindow):
                 "title": self._current_download_title or self.youtube_active_worker.url,
                 "quality": self.youtube_active_worker.quality,
                 "playlist_id": self._current_download_playlist_id,
+                "kind": self._current_download_kind or "music",
             })
         for i in range(self.youtube_queue_list.count()):
             entries.append(self.youtube_queue_list.item(i).data(Qt.ItemDataRole.UserRole))
@@ -1091,8 +1118,10 @@ class MainWindow(QMainWindow):
                 title = entry.get("title") or url
                 quality = entry.get("quality", "192")
                 playlist_id = entry.get("playlist_id")
+                kind = entry.get("kind", "music")
                 item = QListWidgetItem(title)
-                item.setData(Qt.ItemDataRole.UserRole, {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id})
+                item.setData(Qt.ItemDataRole.UserRole,
+                             {"url": url, "title": title, "quality": quality, "playlist_id": playlist_id, "kind": kind})
                 self.youtube_queue_list.addItem(item)
             self._pump_youtube_queue()
         else:
@@ -1158,10 +1187,15 @@ class MainWindow(QMainWindow):
             self._refile_library_track(track_id)
 
     def _refile_library_track(self, track_id: int):
-        """After saving tags for a file that came from the Library's Unsorted
-        tab, re-file it into its correct Artist/Album folder and refresh the
-        index — otherwise it'd keep showing as Unsorted forever, since editing
-        ID3 tags alone doesn't move the file or update the database."""
+        """After saving tags for a library track, re-file it into its correct
+        Artist/Album folder if the new tags changed where it belongs, and
+        refresh the index. Originally built so a track actually leaves
+        Unsorted once it's properly tagged (editing ID3 tags alone doesn't
+        move the file or update the database); reused for editing tags on
+        tracks already filed into Songs/Audiobooks or a playlist, since
+        retagging can change a music track's destination folder either way.
+        If the track belongs to any playlists and got moved, their .m3u8
+        files are rewritten too, since they store paths, not track ids."""
         if not self.library_root:
             return
         from .library.migrate import refile_track
@@ -1172,7 +1206,17 @@ class MainWindow(QMainWindow):
             return
         if moved:
             self._write_log(f"[{ts()}] Re-filed into the library.")
+            from .library.playlists import write_m3u8
+            conn = libdb.open_db(self.library_root)
+            for playlist_id in libdb.playlists_containing_track(conn, track_id):
+                row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                if row:
+                    paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+                    write_m3u8(str(Path(self.library_root) / "Playlists"), row["name"], paths, self.library_root)
+            conn.close()
         self.page_library.refresh()
+        if self.content_stack.currentWidget() is self.page_playlist:
+            self.page_playlist.refresh()
 
     # ---- tagging behavior: batch ----
 
@@ -1254,6 +1298,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # ensures the stylesheet renders consistently instead of
     # fighting the native macOS/Windows widget chrome (source of stray bezel artifacts)
+    load_bundled_fonts()
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
     window.show()

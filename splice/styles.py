@@ -1,5 +1,28 @@
 """Palette constants and the app-wide Qt stylesheet."""
 
+from pathlib import Path
+
+from PyQt6.QtGui import QFontDatabase
+
+FONTS_DIR = Path(__file__).parent / "assets" / "fonts"
+PIXEL_FONT_FAMILY = "Silkscreen"
+
+
+def load_bundled_fonts():
+    """Registers the app's bundled fonts with Qt so every machine renders
+    identically regardless of what's installed system-wide — no install
+    step, ever. Call once, after QApplication exists and before building
+    any widgets (main_window.py's main() does this immediately after
+    constructing QApplication). Silkscreen and Space Mono are both SIL Open
+    Font License, free to bundle and redistribute — license text sits
+    alongside the .ttf files in assets/fonts/."""
+    for filename in ("Silkscreen-Regular.ttf", "Silkscreen-Bold.ttf",
+                      "SpaceMono-Regular.ttf", "SpaceMono-Bold.ttf"):
+        path = FONTS_DIR / filename
+        if path.exists():
+            QFontDatabase.addApplicationFont(str(path))
+
+
 # --- Direction E — grey/pixel HUD, built from the user's own moodboard ---
 # Light grey chassis + white panels (pulled from the lightest reference on
 # the board, a white technical schematic sheet) with a single vivid

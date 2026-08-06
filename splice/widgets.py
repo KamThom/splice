@@ -3,13 +3,12 @@
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
-    QFontMetrics,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -24,10 +23,12 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
     QWidget,
 )
 
-from .styles import BORDER, CONSOLE, GREEN, INK, MUTED, ORANGE, RED, SURFACE
+from .styles import BORDER, CONSOLE, GREEN, INK, MUTED, ORANGE, PIXEL_FONT_FAMILY, RED, SURFACE
 
 
 def extract_dropped_mp3s(event) -> list[str]:
@@ -393,61 +394,34 @@ class CoverArtThumbnail(QLabel):
         self.setText(self.PLACEHOLDER_TEXT)
 
 
-def render_pixel_text(text: str, font_size: int = 8, scale: int = 3, color: str = INK,
-                       weight=QFont.Weight.Bold, letter_spacing: int = 1) -> QPixmap:
-    """Draws text at a tiny font size onto an offscreen pixmap, then scales it
-    up with nearest-neighbor filtering — Qt has no bitmap pixel font built
-    in and this app can't fetch one over the network, so "draw small, blow
-    up crisp" is the same trick used for pixel-art web text."""
-    font = QFont("Menlo")
-    font.setStyleHint(QFont.StyleHint.Monospace)
-    font.setPixelSize(font_size)
-    font.setWeight(weight)
-    metrics = QFontMetrics(font)
-
-    width = sum(metrics.horizontalAdvance(ch) + letter_spacing for ch in text)
-    height = metrics.height()
-
-    small = QPixmap(max(1, width), max(1, height))
-    small.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(small)
-    painter.setFont(font)
-    painter.setPen(QColor(color))
-    x = 0
-    for ch in text:
-        painter.drawText(x, metrics.ascent(), ch)
-        x += metrics.horizontalAdvance(ch) + letter_spacing
-    painter.end()
-
-    return small.scaled(
-        int(round(small.width() * scale)), int(round(small.height() * scale)),
-        Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation,
-    )
-
-
 class PixelLabel(QLabel):
-    """A QLabel whose text renders as blocky pixel type (see
-    render_pixel_text). Reserved for chrome/branding — actual data (track
-    titles, artist names, ...) stays in the app's normal monospace so it's
-    legible, never pixelated."""
+    """A QLabel set in the bundled Silkscreen pixel font — genuine hand-
+    drawn pixel-grid glyphs, not a regular font faked into looking blocky.
+    Reserved for chrome/branding; actual data (track titles, artist names,
+    ...) stays in the app's normal Space Mono so it's legible. Silkscreen
+    is registered with Qt via styles.load_bundled_fonts() at startup, so
+    this just names it directly — no manual pixel-art rendering trick
+    needed once the real font is doing the work."""
 
-    def __init__(self, text: str = "", font_size: int = 8, scale: int = 3,
-                 color: str = INK, letter_spacing: int = 1):
-        super().__init__()
-        self._font_size = font_size
-        self._scale = scale
-        self._color = color
-        self._letter_spacing = letter_spacing
-        if text:
-            self.set_text(text)
-
-    def set_text(self, text: str):
-        pixmap = render_pixel_text(
-            text, font_size=self._font_size, scale=self._scale,
-            color=self._color, letter_spacing=self._letter_spacing,
+    def __init__(self, text: str = "", point_size: int = 13, color: str = INK,
+                 bold: bool = True, letter_spacing: int = 1):
+        super().__init__(text)
+        # letter-spacing has no QSS equivalent, so it has to come from a
+        # QFont via setFont() — but font-family/size/weight from setFont()
+        # get silently overridden by the app-wide stylesheet's QWidget rule
+        # (Qt's QSS cascade beats setFont() for any property it also sets),
+        # so those three are repeated in this label's own stylesheet, which
+        # (being more specific) wins over the app-wide one.
+        font = QFont(PIXEL_FONT_FAMILY)
+        font.setPointSize(point_size)
+        font.setBold(bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter_spacing)
+        self.setFont(font)
+        self.setStyleSheet(
+            f"color: {color}; background: transparent; "
+            f"font-family: '{PIXEL_FONT_FAMILY}'; font-size: {point_size}pt; "
+            f"font-weight: {'bold' if bold else 'normal'};"
         )
-        self.setPixmap(pixmap)
-        self.setFixedSize(pixmap.size())
 
 
 class ChamferedFrame(QFrame):
@@ -490,3 +464,100 @@ class ChamferedFrame(QFrame):
         painter.setPen(QPen(self._border, 1))
         painter.setBrush(self._background)
         painter.drawPath(self._path())
+
+
+def _resized_font(base_font: QFont, delta: int, minimum: int = 8) -> QFont:
+    """Copy of base_font resized by delta, robust to whether its size was
+    set in points or pixels. The app stylesheet sets font-size in px, which
+    leaves QFont.pointSize() at -1 — calling setPointSize() on that (e.g.
+    -1 + 1 = 0) trips Qt's "Point size <= 0" warning on every paint."""
+    font = QFont(base_font)
+    if base_font.pixelSize() > 0:
+        font.setPixelSize(max(minimum, base_font.pixelSize() + delta))
+    else:
+        font.setPointSize(max(minimum, base_font.pointSize() + delta))
+    return font
+
+
+class TrackRowDelegate(QStyledItemDelegate):
+    """Paints each row as a card — title bold, artist muted underneath, an
+    optional badge pill on the right — instead of Qt's default single-line
+    list item. A delegate, not setItemWidget(): with a library of thousands
+    of tracks, setItemWidget() would materialize that many real child
+    widgets at once, where a delegate only ever paints the rows actually
+    visible in the viewport, same as the QTableWidget this replaced.
+
+    Expects Qt.ItemDataRole.UserRole on each item to hold a dict with
+    "title", "artist", and an optional "badge" (a short string, or None to
+    omit the pill entirely — e.g. a track in no playlist shows no badge
+    rather than a "0")."""
+
+    ROW_HEIGHT = 46
+    PADDING_X = 14
+
+    def paint(self, painter: QPainter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        data = index.data(Qt.ItemDataRole.UserRole) or {}
+        title = data.get("title") or ""
+        artist = data.get("artist") or ""
+        badge = data.get("badge")
+
+        rect = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        if selected:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(ORANGE))
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
+        elif hovered:
+            tint = QColor(ORANGE)
+            tint.setAlpha(24)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(tint)
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
+
+        text_color = QColor("#FFFFFF") if selected else QColor(INK)
+        muted_color = QColor("#FFFFFF") if selected else QColor(MUTED)
+
+        badge_width = 0
+        if badge:
+            badge_font = _resized_font(option.font, -1)
+            painter.setFont(badge_font)
+            text_w = painter.fontMetrics().horizontalAdvance(badge)
+            badge_width = text_w + 16
+            badge_rect = QRect(
+                rect.right() - self.PADDING_X - badge_width, rect.center().y() - 10, badge_width, 20
+            )
+            pen_color = QColor("#FFFFFF") if selected else QColor(ORANGE)
+            painter.setPen(QPen(pen_color, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(badge_rect, 9, 9)
+            painter.setPen(pen_color)
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge)
+
+        text_left = rect.left() + self.PADDING_X
+        text_right = rect.right() - self.PADDING_X - (badge_width + 8 if badge else 0)
+        title_rect = QRect(text_left, rect.top() + 6, max(0, text_right - text_left), 20)
+        artist_rect = QRect(text_left, rect.top() + 24, max(0, text_right - text_left), 18)
+
+        title_font = _resized_font(option.font, 1)
+        title_font.setBold(True)
+        painter.setFont(title_font)
+        painter.setPen(text_color)
+        elided_title = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, title_rect.width())
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_title)
+
+        artist_font = QFont(option.font)
+        painter.setFont(artist_font)
+        painter.setPen(muted_color)
+        elided_artist = painter.fontMetrics().elidedText(artist, Qt.TextElideMode.ElideRight, artist_rect.width())
+        painter.drawText(artist_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_artist)
+
+        painter.restore()
+
+    def sizeHint(self, option, index) -> QSize:
+        size = super().sizeHint(option, index)
+        return QSize(size.width(), self.ROW_HEIGHT)

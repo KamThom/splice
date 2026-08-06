@@ -147,6 +147,24 @@ def playlist_membership_counts(conn: sqlite3.Connection) -> dict[int, int]:
     return {row["track_id"]: row["n"] for row in rows}
 
 
+def music_total_duration_seconds(conn: sqlite3.Connection) -> float:
+    """Sum of duration across every music track, including Unsorted — real
+    audio length isn't tag-dependent, so an unfiled track's runtime still
+    counts toward total playtime."""
+    row = conn.execute("SELECT COALESCE(SUM(duration_seconds), 0) AS total FROM tracks WHERE kind = 'music'").fetchone()
+    return row["total"] or 0.0
+
+
+def music_unique_artist_count(conn: sqlite3.Connection) -> int:
+    """Distinct non-blank artists across music tracks. Unsorted tracks
+    routinely have a blank artist (that's usually why they're Unsorted), so
+    they're naturally excluded without a separate filter."""
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT artist) AS n FROM tracks WHERE kind = 'music' AND artist IS NOT NULL AND trim(artist) != ''"
+    ).fetchone()
+    return row["n"] or 0
+
+
 def list_unresolved_fuzzy_dupes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM fuzzy_dupes WHERE resolved = 0").fetchall()
 
@@ -188,3 +206,20 @@ def playlist_track_ids(conn: sqlite3.Connection, playlist_id: int) -> set[int]:
         "SELECT track_id FROM playlist_tracks WHERE playlist_id = ?", (playlist_id,)
     ).fetchall()
     return {row["track_id"] for row in rows}
+
+
+def playlists_containing_track(conn: sqlite3.Connection, track_id: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT playlist_id FROM playlist_tracks WHERE track_id = ?", (track_id,)
+    ).fetchall()
+    return [row["playlist_id"] for row in rows]
+
+
+def delete_track(conn: sqlite3.Connection, track_id: int):
+    """Removes a track from the index entirely — the caller is responsible
+    for deleting the underlying file and rewriting any playlists' .m3u8
+    files (playlists_containing_track, called before this, tells you which)."""
+    conn.execute("DELETE FROM playlist_tracks WHERE track_id = ?", (track_id,))
+    conn.execute("DELETE FROM fuzzy_dupes WHERE track_id_a = ? OR track_id_b = ?", (track_id, track_id))
+    conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
+    conn.commit()
