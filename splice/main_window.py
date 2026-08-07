@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         self.page_library = LibraryView(self._get_library_root, self._set_library_root)
         self.page_library.fixTagsRequested.connect(self._fix_tags_for_path)
         self.page_library.libraryChanged.connect(self._refresh_sidebar_playlists)
+        self.page_library.playlistActivated.connect(lambda pid, name: self._on_navigate("playlist", (pid, name)))
         self.page_library.libraryLocationChanged.connect(
             lambda path: self._write_log(f"[{ts()}] Library location set to: {path}")
         )
@@ -186,9 +187,15 @@ class MainWindow(QMainWindow):
         if not self.library_root or not Path(self.library_root).exists():
             self.playlist_deck.set_playlists([])
         else:
+            from .library.playlists import find_playlist_artwork
             conn = libdb.open_db(self.library_root)
-            playlists = [(p["id"], p["name"]) for p in libdb.list_playlists(conn)]
+            rows = libdb.list_playlists(conn)
             conn.close()
+            playlists = []
+            for p in rows:
+                art_path = find_playlist_artwork(self.library_root, p["id"])
+                art_bytes = art_path.read_bytes() if art_path else None
+                playlists.append((p["id"], p["name"], art_bytes))
             self.playlist_deck.set_playlists(playlists)
         self._refresh_youtube_playlist_combo()
 

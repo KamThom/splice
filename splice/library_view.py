@@ -38,9 +38,9 @@ from .library.export import (
     list_audiobook_entries,
 )
 from .library.migrate import LibraryBuildWorker, LibraryScanWorker, MusicSource
-from .library.playlists import write_m3u8
+from .library.playlists import clear_playlist_artwork, find_playlist_artwork, set_playlist_artwork, write_m3u8
 from .styles import INK, MUTED
-from .widgets import ChamferedFrame, LevelGauge, PixelLabel, TrackRowDelegate
+from .widgets import ChamferedArtTile, ChamferedFrame, LevelGauge, PixelLabel, TrackListWidget, TrackRowDelegate
 from .workers import sanitize_filename
 
 
@@ -64,13 +64,16 @@ def _is_unsorted(library_path: str) -> bool:
     return "_Unsorted" in Path(library_path).parts
 
 
-def make_track_list() -> QListWidget:
+def make_track_list() -> TrackListWidget:
     """Read-only card-style track list, shared by the Library view's Songs
     and Audiobooks tabs. Each row is painted by TrackRowDelegate (title
     bold, artist muted underneath, a playlist-count badge) rather than
     Qt's default single-line item — setMouseTracking is required for the
-    delegate's hover state to update as the mouse moves, not just on click."""
-    list_widget = QListWidget()
+    delegate's hover state to update as the mouse moves, not just on click.
+    TrackListWidget (rather than a plain QListWidget) is what lets clicking
+    directly on the badge pill emit badgeClicked instead of just selecting
+    the row."""
+    list_widget = TrackListWidget()
     list_widget.setItemDelegate(TrackRowDelegate(list_widget))
     list_widget.setMouseTracking(True)
     list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -689,6 +692,7 @@ class LibraryView(QWidget):
     fixTagsRequested = pyqtSignal(str, int)  # mp3 path, track_id — Unsorted tab's "Fix Tags" action
     libraryChanged = pyqtSignal()  # emitted after every refresh — sidebar playlist list listens to this
     libraryLocationChanged = pyqtSignal(str)  # new library_root — MainWindow logs this to the console
+    playlistActivated = pyqtSignal(int, str)  # playlist_id, name — picked from a track's badge-click menu
 
     def __init__(self, get_library_root, set_library_root):
         super().__init__()
@@ -768,6 +772,8 @@ class LibraryView(QWidget):
         self.sub_tabs = QTabWidget()
         self.songs_list = make_track_list()
         self.audiobooks_list = make_track_list()
+        self.songs_list.badgeClicked.connect(self._show_playlist_membership_menu)
+        self.audiobooks_list.badgeClicked.connect(self._show_playlist_membership_menu)
         self.duplicates_list = QListWidget()
         self.unsorted_list = QListWidget()
 
@@ -1003,6 +1009,23 @@ class LibraryView(QWidget):
         full_path = str(Path(library_root) / data["library_path"])
         self.fixTagsRequested.emit(full_path, data["id"])
 
+    def _show_playlist_membership_menu(self, track_id: int, global_pos):
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        rows = libdb.playlists_for_track(conn, track_id)
+        conn.close()
+        if not rows:
+            return
+        menu = QMenu(self)
+        for row in rows:
+            action = menu.addAction(row["name"])
+            action.triggered.connect(
+                lambda checked=False, pid=row["id"], name=row["name"]: self.playlistActivated.emit(pid, name)
+            )
+        menu.exec(global_pos)
+
     def _remove_selected_tracks(self):
         active_list = self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
         items = active_list.selectedItems()
@@ -1190,9 +1213,23 @@ class PlaylistView(QWidget):
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(10)
 
-        self.title_label = QLabel("PLAYLIST")
-        self.title_label.setObjectName("panelTitle")
-        layout.addWidget(self.title_label)
+        hero_row = QHBoxLayout()
+        hero_row.setSpacing(16)
+        self.art_tile = ChamferedArtTile(size=96, chamfer=16, clickable=True)
+        self.art_tile.clicked.connect(self._choose_artwork)
+        hero_row.addWidget(self.art_tile)
+
+        meta_col = QVBoxLayout()
+        meta_col.setSpacing(3)
+        meta_col.addWidget(PixelLabel("PLAYLIST", point_size=9, color=MUTED, letter_spacing=2))
+        self.title_label = PixelLabel("", point_size=16, letter_spacing=1)
+        meta_col.addWidget(self.title_label)
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setObjectName("muted")
+        meta_col.addWidget(self.subtitle_label)
+        meta_col.addStretch(1)
+        hero_row.addLayout(meta_col, stretch=1)
+        layout.addLayout(hero_row)
 
         top_row = QHBoxLayout()
         add_btn = QPushButton("ADD TRACKS...")
@@ -1205,6 +1242,8 @@ class PlaylistView(QWidget):
         settings_menu = QMenu(self)
         edit_tags_action = QAction("EDIT TAGS", self)
         edit_tags_action.triggered.connect(self._edit_tags_selected)
+        remove_artwork_action = QAction("REMOVE ARTWORK", self)
+        remove_artwork_action.triggered.connect(self._remove_artwork)
         remove_action = QAction("REMOVE SELECTED", self)
         remove_action.triggered.connect(self._remove_selected)
         copy_action = QAction("COPY SELECTED...", self)
@@ -1214,6 +1253,7 @@ class PlaylistView(QWidget):
         delete_action = QAction("DELETE PLAYLIST", self)
         delete_action.triggered.connect(self._delete_playlist)
         settings_menu.addAction(edit_tags_action)
+        settings_menu.addAction(remove_artwork_action)
         settings_menu.addSeparator()
         settings_menu.addAction(remove_action)
         settings_menu.addAction(copy_action)
@@ -1240,7 +1280,7 @@ class PlaylistView(QWidget):
     def show_playlist(self, playlist_id: int, name: str):
         self._playlist_id = playlist_id
         self._playlist_name = name
-        self.title_label.setText(f"PLAYLIST — {name}")
+        self.title_label.setText(name.upper())
         self.refresh()
 
     def _library_root_or_none(self) -> str | None:
@@ -1255,9 +1295,12 @@ class PlaylistView(QWidget):
         library_root = self._library_root_or_none()
         self.track_list.clear()
         if not library_root:
+            self._load_artwork()
             return
         conn = libdb.open_db(library_root)
         paths = libdb.playlist_track_paths_in_order(conn, self._playlist_id)
+        total_seconds = 0.0
+        track_count = 0
         for path in paths:
             row = conn.execute("SELECT * FROM tracks WHERE library_path = ?", (path,)).fetchone()
             if row:
@@ -1270,7 +1313,23 @@ class PlaylistView(QWidget):
                     "badge": None,  # playlist order is the point here, not membership count
                 })
                 self.track_list.addItem(item)
+                total_seconds += row["duration_seconds"] or 0.0
+                track_count += 1
         conn.close()
+        if track_count:
+            label = "track" if track_count == 1 else "tracks"
+            self.subtitle_label.setText(f"{track_count} {label} · {_format_total_playtime(total_seconds)}")
+        else:
+            self.subtitle_label.setText("No tracks yet")
+        self._load_artwork()
+
+    def _load_artwork(self):
+        library_root = self._library_root_or_none()
+        if not library_root or self._playlist_id is None:
+            self.art_tile.clear_art()
+            return
+        art_path = find_playlist_artwork(library_root, self._playlist_id)
+        self.art_tile.set_art(art_path.read_bytes() if art_path else None)
 
     def _write_current_m3u8(self, library_root: str):
         conn = libdb.open_db(library_root)
@@ -1328,6 +1387,31 @@ class PlaylistView(QWidget):
         full_path = str(Path(library_root) / data["library_path"])
         self.fixTagsRequested.emit(full_path, data["id"])
 
+    def _choose_artwork(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose playlist artwork", str(Path.home()), "Images (*.jpg *.jpeg *.png *.webp *.bmp)"
+        )
+        if not path:
+            return
+        set_playlist_artwork(library_root, self._playlist_id, path)
+        self._load_artwork()
+        self.playlistsChanged.emit()
+
+    def _remove_artwork(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        clear_playlist_artwork(library_root, self._playlist_id)
+        self._load_artwork()
+        self.playlistsChanged.emit()
+
     def _open_add_tracks_dialog(self):
         if self._playlist_id is None:
             return
@@ -1362,10 +1446,13 @@ class PlaylistView(QWidget):
         m3u8_path = Path(library_root) / "Playlists" / f"{self._playlist_name}.m3u8"
         if m3u8_path.exists():
             m3u8_path.unlink()
+        clear_playlist_artwork(library_root, self._playlist_id)
         self._playlist_id = None
         self._playlist_name = None
         self.track_list.clear()
-        self.title_label.setText("PLAYLIST")
+        self.title_label.setText("")
+        self.subtitle_label.setText("")
+        self.art_tile.clear_art()
         self.playlistsChanged.emit()
 
     def _open_export_dialog(self):

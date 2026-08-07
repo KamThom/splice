@@ -3,12 +3,13 @@
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QFontMetrics,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -466,6 +467,116 @@ class ChamferedFrame(QFrame):
         painter.drawPath(self._path())
 
 
+def render_chamfered_pixmap(
+    image_bytes: bytes | None, size: int, chamfer: int,
+    border_color: str = BORDER, background: str = CONSOLE, muted: str = MUTED,
+) -> QPixmap:
+    """A size x size square with one corner cut at 45° (matching
+    ChamferedFrame's stat-card shape), filled with image_bytes cropped to
+    cover, or a recessed "NO ARTWORK" placeholder if there's no image yet.
+    Used at three scales for playlist artwork: a small Playlist Deck row
+    icon, a larger PlaylistView header tile, and — sized for later, not
+    built yet — a now-playing bar's mini art, so all three read as the same
+    object rather than three separately-invented treatments."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    r = QRectF(0, 0, size, size).adjusted(0.5, 0.5, -0.5, -0.5)
+    path = QPainterPath()
+    path.moveTo(r.left(), r.top() + chamfer)
+    path.lineTo(r.left() + chamfer, r.top())
+    path.lineTo(r.right(), r.top())
+    path.lineTo(r.right(), r.bottom())
+    path.lineTo(r.left(), r.bottom())
+    path.closeSubpath()
+
+    image = None
+    if image_bytes:
+        candidate = QPixmap()
+        if candidate.loadFromData(image_bytes):
+            image = candidate
+
+    painter.setClipPath(path)
+    if image is not None:
+        scaled = image.scaled(
+            size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation
+        )
+        painter.drawPixmap((size - scaled.width()) // 2, (size - scaled.height()) // 2, scaled)
+    else:
+        painter.fillPath(path, QColor(background))
+    painter.setClipping(False)
+
+    painter.setPen(QPen(QColor(border_color), 1))
+    painter.drawPath(path)
+
+    if image is None and size >= 60:
+        painter.setPen(QColor(muted))
+        font = QFont(painter.font())
+        font.setPointSize(8)
+        painter.setFont(font)
+        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "NO\nARTWORK")
+
+    painter.end()
+    return pixmap
+
+
+class ChamferedArtTile(QLabel):
+    """A render_chamfered_pixmap(), kept in a QLabel so it can sit in a
+    layout like any other widget. clickable=True (the PlaylistView header
+    tile) shows a pointing-hand cursor and an orange hover border, and emits
+    clicked() instead of doing anything with the click itself — the caller
+    owns what "click to change artwork" actually does (open a file dialog).
+    The Playlist Deck's small row icon isn't a ChamferedArtTile — that one
+    goes through QListWidgetItem.setIcon() instead, since deck rows are
+    list items, not widgets."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, size: int = 96, chamfer: int = 16, clickable: bool = False):
+        super().__init__()
+        self._size = size
+        self._chamfer = chamfer
+        self._clickable = clickable
+        self._image_bytes = None
+        self._hovering = False
+        self.setFixedSize(size, size)
+        if clickable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("Click to set playlist artwork")
+        self._render()
+
+    def set_art(self, image_bytes: bytes | None):
+        self._image_bytes = image_bytes
+        self._render()
+
+    def clear_art(self):
+        self.set_art(None)
+
+    def _render(self):
+        border = ORANGE if (self._clickable and self._hovering) else BORDER
+        self.setPixmap(render_chamfered_pixmap(self._image_bytes, self._size, self._chamfer, border_color=border))
+
+    def enterEvent(self, event):
+        if self._clickable:
+            self._hovering = True
+            self._render()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._clickable:
+            self._hovering = False
+            self._render()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            return
+        super().mousePressEvent(event)
+
+
 def _resized_font(base_font: QFont, delta: int, minimum: int = 8) -> QFont:
     """Copy of base_font resized by delta, robust to whether its size was
     set in points or pixels. The app stylesheet sets font-size in px, which
@@ -494,6 +605,18 @@ class TrackRowDelegate(QStyledItemDelegate):
 
     ROW_HEIGHT = 46
     PADDING_X = 14
+
+    @staticmethod
+    def badge_rect(row_rect: QRect, base_font: QFont, badge: str) -> QRect:
+        """Rect of the badge pill within a row — shared by paint() and
+        TrackListWidget's click hit-testing so the two can never disagree
+        about where the pill actually is."""
+        badge_font = _resized_font(base_font, -1)
+        badge_width = QFontMetrics(badge_font).horizontalAdvance(badge) + 16
+        return QRect(
+            row_rect.right() - TrackRowDelegate.PADDING_X - badge_width,
+            row_rect.center().y() - 10, badge_width, 20,
+        )
 
     def paint(self, painter: QPainter, option, index):
         painter.save()
@@ -561,3 +684,27 @@ class TrackRowDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index) -> QSize:
         size = super().sizeHint(option, index)
         return QSize(size.width(), self.ROW_HEIGHT)
+
+
+class TrackListWidget(QListWidget):
+    """QListWidget paired with TrackRowDelegate for Songs/Audiobooks. A plain
+    QListWidget can't distinguish "clicked the row" from "clicked the badge
+    pill on the row" — this override checks whether a left-click landed
+    inside the pill's rect (via TrackRowDelegate.badge_rect, so it's always
+    exactly the area actually painted) and emits badgeClicked instead of
+    letting the click fall through to normal row selection."""
+
+    badgeClicked = pyqtSignal(int, QPoint)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.pos())
+            if item is not None:
+                data = item.data(Qt.ItemDataRole.UserRole) or {}
+                badge = data.get("badge")
+                if badge:
+                    rect = TrackRowDelegate.badge_rect(self.visualItemRect(item), self.font(), badge)
+                    if rect.contains(event.pos()):
+                        self.badgeClicked.emit(data["id"], event.globalPosition().toPoint())
+                        return
+        super().mousePressEvent(event)

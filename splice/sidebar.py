@@ -5,7 +5,7 @@ sidebar) is what lets Playlists get its own single-scrollbar column instead
 of a capped, double-scrolling section fighting the tools list for space."""
 
 from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractButton,
     QHBoxLayout,
@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .styles import BG, BORDER, MUTED, ORANGE, PIXEL_FONT_FAMILY
-from .widgets import PixelLabel
+from .widgets import PixelLabel, render_chamfered_pixmap
 
 TOOLS = [("merge", "MERGE"), ("split", "SPLIT"), ("youtube", "YOUTUBE"), ("tags", "TAGS")]
 
@@ -145,11 +145,16 @@ class PlaylistDeck(QWidget):
     """Emits navigate("playlist", (playlist_id, name)) on selection,
     createRequested when the "+" button is clicked, and renameRequested when
     a double-click-to-edit finishes. This widget never touches the database
-    itself — MainWindow owns that, same separation as everywhere else."""
+    or filesystem itself — MainWindow owns that (including reading each
+    playlist's artwork bytes, if any, before calling set_playlists), same
+    separation as everywhere else."""
 
     navigate = pyqtSignal(str, object)
     createRequested = pyqtSignal()
     renameRequested = pyqtSignal(int, str)
+
+    THUMB_SIZE = 26
+    THUMB_CHAMFER = 6
 
     def __init__(self):
         super().__init__()
@@ -172,6 +177,7 @@ class PlaylistDeck(QWidget):
 
         self.playlist_list = QListWidget()
         self.playlist_list.setObjectName("sidebarList")
+        self.playlist_list.setIconSize(QSize(self.THUMB_SIZE, self.THUMB_SIZE))
         self.playlist_list.itemClicked.connect(self._on_playlist_clicked)
         self.playlist_list.itemChanged.connect(self._on_playlist_renamed)
         # No fixed/capped height here, deliberately — the list fills whatever
@@ -191,12 +197,14 @@ class PlaylistDeck(QWidget):
         playlist_id = item.data(Qt.ItemDataRole.UserRole)
         self.renameRequested.emit(playlist_id, new_name)
 
-    def set_playlists(self, playlists: list[tuple[int, str]]):
-        """playlists: list of (playlist_id, name), in display order."""
+    def set_playlists(self, playlists: list[tuple[int, str, bytes | None]]):
+        """playlists: list of (playlist_id, name, artwork_bytes_or_None), in
+        display order."""
         self.playlist_list.blockSignals(True)  # rebuilding the list is not a user rename
         self.playlist_list.clear()
-        for playlist_id, name in playlists:
+        for playlist_id, name, art_bytes in playlists:
             item = QListWidgetItem(name)
+            item.setIcon(QIcon(render_chamfered_pixmap(art_bytes, self.THUMB_SIZE, self.THUMB_CHAMFER)))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             item.setData(Qt.ItemDataRole.UserRole, playlist_id)
             self.playlist_list.addItem(item)

@@ -215,6 +215,18 @@ def playlists_containing_track(conn: sqlite3.Connection, track_id: int) -> list[
     return [row["playlist_id"] for row in rows]
 
 
+def playlists_for_track(conn: sqlite3.Connection, track_id: int) -> list[sqlite3.Row]:
+    """Playlists (id, name) containing a track, ordered by name — powers the
+    playlist-membership badge's click menu on Songs/Audiobooks rows."""
+    return conn.execute(
+        """SELECT p.id, p.name FROM playlists p
+           JOIN playlist_tracks pt ON pt.playlist_id = p.id
+           WHERE pt.track_id = ?
+           ORDER BY p.name""",
+        (track_id,),
+    ).fetchall()
+
+
 def delete_track(conn: sqlite3.Connection, track_id: int):
     """Removes a track from the index entirely — the caller is responsible
     for deleting the underlying file and rewriting any playlists' .m3u8
