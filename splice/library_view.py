@@ -2,6 +2,7 @@
 Duplicates, and Unsorted, and the ADD SOURCES migration wizard that builds or
 extends the library from existing folders."""
 
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
@@ -12,7 +13,9 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
@@ -28,7 +31,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from . import tagging
 from .library import db as libdb
+from .library import loudness
 from .library.export import (
     CopyReport,
     CopyTracksWorker,
@@ -37,9 +42,9 @@ from .library.export import (
     ExportWorker,
     list_audiobook_entries,
 )
-from .library.migrate import LibraryBuildWorker, LibraryScanWorker, MusicSource
+from .library.migrate import AddFilesWorker, LibraryBuildWorker, LibraryScanWorker, MusicSource, adopt_orphan_file
 from .library.playlists import clear_playlist_artwork, find_playlist_artwork, set_playlist_artwork, write_m3u8
-from .styles import INK, MUTED
+from .styles import GREEN, MUTED, ORANGE, RED, STAT_AMBER, STAT_BLUE, STAT_PURPLE
 from .widgets import ChamferedArtTile, ChamferedFrame, LevelGauge, PixelLabel, TrackListWidget, TrackRowDelegate
 from .workers import sanitize_filename
 
@@ -92,6 +97,8 @@ def populate_track_list(list_widget: QListWidget, tracks, membership: dict):
             "title": t["title"] or Path(t["library_path"]).stem,
             "artist": t["artist"] or "",
             "badge": str(count) if count else None,
+            "loudness_lufs": t["loudness_lufs"],
+            "loudness_true_peak": t["loudness_true_peak"],
         })
         list_widget.addItem(item)
 
@@ -125,6 +132,40 @@ def sort_tracks(tracks, membership: dict, field: str, ascending: bool):
     else:
         key = _SORT_KEY_FUNCS.get(field, _SORT_KEY_FUNCS["Title"])
     return sorted(tracks, key=key, reverse=not ascending)
+
+
+HEALTH_CATEGORIES = ["Duplicates", "Missing Tags", "Missing Art", "Missing Files", "Orphaned Files"]
+HEALTH_TAB_INDEX = 4
+
+
+def _find_missing_tags(tracks):
+    """Filed (non-Unsorted) music tracks missing date or tracknumber —
+    title/artist/album can't be blank on a filed track (naming.music_destination
+    routes any blank one to _Unsorted instead), so this is the one metadata
+    gap a properly-filed track can still have."""
+    return [t for t in tracks if not (t["date"] or "").strip() or not (t["tracknumber"] or "").strip()]
+
+
+def _find_missing_files(library_root: str, tracks) -> list:
+    """Indexed tracks whose file no longer exists on disk — covers "broken
+    playlist references" too, since a playlist only ever references a track
+    row, not a file directly."""
+    return [t for t in tracks if not (Path(library_root) / t["library_path"]).exists()]
+
+
+def _find_orphaned_files(library_root: str, known_paths: set) -> list[tuple[str, str]]:
+    """Real files under Library/Music or Library/Audiobooks with no tracks
+    row — returns (library_path, kind) pairs."""
+    orphans = []
+    for subdir, kind in (("Music", "music"), ("Audiobooks", "audiobook")):
+        base = Path(library_root) / subdir
+        if not base.exists():
+            continue
+        for p in base.rglob("*.mp3"):
+            rel = p.relative_to(library_root).as_posix()
+            if rel not in known_paths:
+                orphans.append((rel, kind))
+    return orphans
 
 
 class LibraryMigrationDialog(QDialog):
@@ -592,6 +633,171 @@ class CopyTracksDialog(QDialog):
         self.report_label.setText(text)
 
 
+class AddFilesDialog(QDialog):
+    """Files chosen mp3s directly into the library — Music or Audiobook,
+    optionally into a playlist — without requiring a full Add Sources folder
+    scan. Reuses migrate.py's AddFilesWorker (same file_single_track call
+    YouTube downloads and the Merge handoff already use)."""
+
+    def __init__(self, parent, library_root: str, default_playlist_id: int | None = None, lock_to_music: bool = False):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.lock_to_music = lock_to_music
+        self.added_any = False
+        self.setWindowTitle("Add Files")
+        self.resize(520, 480)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("Add mp3 files directly to your library — no folder scan needed.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.file_list = QListWidget()
+        self.file_list.setObjectName("filePicker")
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.file_list, stretch=1)
+
+        file_btn_row = QHBoxLayout()
+        choose_btn = QPushButton("+ CHOOSE FILES...")
+        choose_btn.clicked.connect(self._choose_files)
+        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn.clicked.connect(self._remove_selected_files)
+        file_btn_row.addWidget(choose_btn)
+        file_btn_row.addWidget(remove_btn)
+        file_btn_row.addStretch(1)
+        layout.addLayout(file_btn_row)
+
+        dest_row = QHBoxLayout()
+        self.dest_label = QLabel("File as:")
+        self.dest_label.setObjectName("muted")
+        dest_row.addWidget(self.dest_label)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Music (library)", "music")
+        self.kind_combo.addItem("Audiobook (library)", "audiobook")
+        self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
+        dest_row.addWidget(self.kind_combo)
+        if lock_to_music:
+            # Playlists are a music-only concept everywhere else in this app —
+            # no point offering a kind choice when the caller already knows
+            # the answer is always "music".
+            self.dest_label.setVisible(False)
+            self.kind_combo.setVisible(False)
+
+        playlist_label = QLabel("Add to:")
+        playlist_label.setObjectName("muted")
+        dest_row.addWidget(playlist_label)
+        self.playlist_combo = QComboBox()
+        self._refresh_playlist_combo()
+        if default_playlist_id is not None:
+            idx = self.playlist_combo.findData(default_playlist_id)
+            if idx >= 0:
+                self.playlist_combo.setCurrentIndex(idx)
+        self.playlist_combo.currentIndexChanged.connect(self._on_playlist_combo_changed)
+        dest_row.addWidget(self.playlist_combo)
+        layout.addLayout(dest_row)
+
+        action_row = QHBoxLayout()
+        self.add_btn = QPushButton("ADD")
+        self.add_btn.setObjectName("primary")
+        self.add_btn.clicked.connect(self._run_add)
+        action_row.addWidget(self.add_btn)
+        layout.addLayout(action_row)
+
+        self.gauge = LevelGauge()
+        layout.addWidget(self.gauge)
+
+        self.report_label = QLabel("")
+        self.report_label.setObjectName("muted")
+        self.report_label.setWordWrap(True)
+        layout.addWidget(self.report_label)
+
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box, stretch=1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("CLOSE")
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        layout.addLayout(close_row)
+
+    def _choose_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose mp3 files to add", str(Path.home()), "Audio files (*.mp3)"
+        )
+        existing = {self.file_list.item(i).text() for i in range(self.file_list.count())}
+        for path in paths:
+            if path not in existing:
+                self.file_list.addItem(path)
+
+    def _remove_selected_files(self):
+        for item in self.file_list.selectedItems():
+            self.file_list.takeItem(self.file_list.row(item))
+
+    def _on_kind_changed(self, index: int):
+        is_music = self.kind_combo.itemData(index) == "music"
+        self.playlist_combo.setEnabled(is_music)
+        if not is_music:
+            self.playlist_combo.setCurrentIndex(0)
+
+    def _refresh_playlist_combo(self):
+        previous = self.playlist_combo.currentData() if self.playlist_combo.count() else None
+        self.playlist_combo.blockSignals(True)
+        self.playlist_combo.clear()
+        self.playlist_combo.addItem("No playlist (library only)", None)
+        conn = libdb.open_db(self.library_root)
+        for p in libdb.list_playlists(conn):
+            self.playlist_combo.addItem(p["name"], p["id"])
+        conn.close()
+        self.playlist_combo.addItem("+ New Playlist...", "__new__")
+        idx = self.playlist_combo.findData(previous)
+        self.playlist_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.playlist_combo.blockSignals(False)
+
+    def _on_playlist_combo_changed(self, index: int):
+        if self.playlist_combo.itemData(index) != "__new__":
+            return
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        if ok and name.strip():
+            conn = libdb.open_db(self.library_root)
+            playlist_id = libdb.get_or_create_playlist(conn, name.strip())
+            conn.close()
+            self._refresh_playlist_combo()
+            idx = self.playlist_combo.findData(playlist_id)
+            self.playlist_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            self.playlist_combo.setCurrentIndex(0)
+
+    def _run_add(self):
+        paths = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+        if not paths:
+            QMessageBox.information(self, "No files", "Choose one or more mp3 files first.")
+            return
+        self.add_btn.setEnabled(False)
+        self.gauge.set_idle()
+        self.report_label.setText("")
+        kind = "music" if self.lock_to_music else self.kind_combo.currentData()
+        playlist_id = self.playlist_combo.currentData() if kind == "music" else None
+        self._worker = AddFilesWorker(self.library_root, paths, kind, playlist_id)
+        self._worker.log.connect(self._log)
+        self._worker.progress.connect(self.gauge.set_progress)
+        self._worker.finished_ok.connect(self._on_add_done)
+        self._worker.start()
+
+    def _log(self, msg: str):
+        self.log_box.appendPlainText(msg)
+
+    def _on_add_done(self, added_count: int):
+        self.gauge.set_done("ADD COMPLETE")
+        self.add_btn.setEnabled(True)
+        self.report_label.setText(f"{added_count} of {self.file_list.count()} file(s) added.")
+        if added_count:
+            self.added_any = True
+        self.file_list.clear()
+
+
 def _format_duration(seconds) -> str:
     if not seconds:
         return "—"
@@ -684,6 +890,166 @@ class ResolveDuplicateDialog(QDialog):
         self.accept()
 
 
+def _format_added_date(added_at: str | None) -> str:
+    if not added_at:
+        return "—"
+    try:
+        return datetime.fromisoformat(added_at).strftime("%b %d, %Y")
+    except ValueError:
+        return "—"
+
+
+class TrackInfoDialog(QDialog):
+    """Read-only "what is this track" view — art, every tag field, duration/
+    file size/added date, measured loudness vs. target, and which playlists
+    it's in. Distinct from the Tags editor, which is for *changing* things;
+    this is for just looking. Self-contained like every other dialog in this
+    file: takes only enough to look everything else up itself. `kind` comes
+    from the caller (Songs vs. Audiobooks tab; playlists are always music)
+    rather than the row, since it drives the loudness-target lookup and the
+    missing-art flag below. EDIT TAGS doesn't emit fixTagsRequested itself —
+    that signal belongs to LibraryView/PlaylistView — it just sets
+    edit_tags_requested and closes; the caller checks that after exec() and
+    emits it, same "dialog sets an attribute, caller acts on it" convention
+    AddToPlaylistDialog/ResolveDuplicateDialog already use."""
+
+    def __init__(self, parent, library_root: str, track_id: int, kind: str):
+        super().__init__(parent)
+        self.edit_tags_requested = False
+        self.setWindowTitle("Track Info")
+        self.resize(620, 420)
+
+        conn = libdb.open_db(library_root)
+        row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+        playlist_rows = libdb.playlists_for_track(conn, track_id)
+        conn.close()
+
+        full_path = Path(library_root) / row["library_path"]
+        art_bytes = None
+        try:
+            art_bytes = tagging.read_tags(str(full_path)).get("art")
+        except Exception:
+            pass  # file missing/unreadable — falls back to the placeholder tile
+
+        layout = QVBoxLayout(self)
+
+        header_title = QLabel("TRACK INFO")
+        header_title.setObjectName("panelTitle")
+        layout.addWidget(header_title)
+
+        body = QHBoxLayout()
+        body.setSpacing(20)
+        body.addLayout(self._build_left_pane(row, full_path, art_bytes))
+        body.addLayout(self._build_right_pane(row, kind, art_bytes, playlist_rows), stretch=1)
+        layout.addLayout(body)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        edit_btn = QPushButton("EDIT TAGS")
+        edit_btn.clicked.connect(self._request_edit_tags)
+        footer.addWidget(edit_btn)
+        close_btn = QPushButton("CLOSE")
+        close_btn.setObjectName("primary")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+    def _build_left_pane(self, row, full_path: Path, art_bytes: bytes | None) -> QVBoxLayout:
+        col = QVBoxLayout()
+        art = ChamferedArtTile(size=168, chamfer=16, clickable=False)
+        art.set_art(art_bytes)
+        col.addWidget(art)
+        col.addLayout(self._field("DURATION", _format_duration(row["duration_seconds"])))
+        col.addLayout(self._field("FILE SIZE", _format_filesize(full_path)))
+        col.addLayout(self._field("ADDED", _format_added_date(row["added_at"])))
+        col.addStretch(1)
+        return col
+
+    def _build_right_pane(self, row, kind: str, art_bytes: bytes | None, playlist_rows) -> QVBoxLayout:
+        col = QVBoxLayout()
+
+        heading_row = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title_label = QLabel(row["title"] or Path(row["library_path"]).stem)
+        title_label.setObjectName("panelTitle")
+        title_label.setWordWrap(True)
+        title_col.addWidget(title_label)
+        artist_label = QLabel(row["artist"] or "Unknown Artist")
+        artist_label.setObjectName("muted")
+        title_col.addWidget(artist_label)
+        heading_row.addLayout(title_col, stretch=1)
+        if kind == "music" and not art_bytes:
+            heading_row.addWidget(PixelLabel("MISSING ART", point_size=8, color=RED, letter_spacing=1))
+        col.addLayout(heading_row)
+
+        rule1 = QFrame()
+        rule1.setObjectName("rule")
+        col.addWidget(rule1)
+
+        row1 = QHBoxLayout()
+        row1.addLayout(self._field("ALBUM", row["album"] or "—"))
+        row1.addLayout(self._field("DATE", row["date"] or "—"))
+        col.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addLayout(self._field("TRACK #", row["tracknumber"] or "—"))
+        row2.addLayout(self._field("LOUDNESS", self._loudness_text(row, kind)))
+        col.addLayout(row2)
+
+        col.addLayout(self._field("LIBRARY PATH", row["library_path"], muted_value=True))
+
+        rule2 = QFrame()
+        rule2.setObjectName("rule")
+        col.addWidget(rule2)
+
+        col.addWidget(PixelLabel("IN PLAYLISTS", point_size=8, color=MUTED, letter_spacing=1))
+        col.addLayout(self._build_playlist_chips(playlist_rows))
+
+        col.addStretch(1)
+        return col
+
+    def _loudness_text(self, row, kind: str) -> str:
+        lufs, true_peak = row["loudness_lufs"], row["loudness_true_peak"]
+        if lufs is None or true_peak is None:
+            return "Not yet measured"
+        gain = loudness.compute_gain_db(lufs, true_peak, kind)
+        target = loudness.TARGET_LUFS.get(kind, loudness.TARGET_LUFS["music"])
+        return f"{lufs:.1f} LUFS (target {target:.0f}, {gain:+.1f}dB)"
+
+    def _field(self, label_text: str, value_text: str, muted_value: bool = False) -> QVBoxLayout:
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.addWidget(PixelLabel(label_text, point_size=8, color=MUTED, letter_spacing=1))
+        value = QLabel(value_text)
+        value.setWordWrap(True)
+        if muted_value:
+            value.setObjectName("muted")
+        col.addWidget(value)
+        return col
+
+    def _build_playlist_chips(self, playlist_rows) -> QHBoxLayout:
+        row = QHBoxLayout()
+        if not playlist_rows:
+            not_in_playlist = QLabel("Not in any playlist")
+            not_in_playlist.setObjectName("muted")
+            row.addWidget(not_in_playlist)
+            row.addStretch(1)
+            return row
+        for p in playlist_rows:
+            chip = QLabel(p["name"])
+            chip.setStyleSheet(
+                f"border: 1px solid {ORANGE}; color: {ORANGE}; border-radius: 9px; padding: 3px 10px;"
+            )
+            row.addWidget(chip)
+        row.addStretch(1)
+        return row
+
+    def _request_edit_tags(self):
+        self.edit_tags_requested = True
+        self.accept()
+
+
 class LibraryView(QWidget):
     """The app's home screen. get_library_root/set_library_root let this view
     share the persisted library location with MainWindow without owning
@@ -693,6 +1059,8 @@ class LibraryView(QWidget):
     libraryChanged = pyqtSignal()  # emitted after every refresh — sidebar playlist list listens to this
     libraryLocationChanged = pyqtSignal(str)  # new library_root — MainWindow logs this to the console
     playlistActivated = pyqtSignal(int, str)  # playlist_id, name — picked from a track's badge-click menu
+    playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path), start index — double-clicked a song
+    healthRescanRequested = pyqtSignal()  # HEALTH tab's RESCAN button — nudges MainWindow's background art-check worker
 
     def __init__(self, get_library_root, set_library_root):
         super().__init__()
@@ -726,11 +1094,11 @@ class LibraryView(QWidget):
         self.stat_playlists_value = QLabel("0")
         self.stat_playtime_value = QLabel("0m")
         self.stat_artists_value = QLabel("0")
-        stats_row.addWidget(self._make_stat_card("SONGS", self.stat_songs_value, MUTED))
-        stats_row.addWidget(self._make_stat_card("AUDIOBOOKS", self.stat_audiobooks_value, MUTED))
-        stats_row.addWidget(self._make_stat_card("PLAYLISTS", self.stat_playlists_value, MUTED))
-        stats_row.addWidget(self._make_stat_card("PLAYTIME", self.stat_playtime_value, MUTED))
-        stats_row.addWidget(self._make_stat_card("ARTISTS", self.stat_artists_value, MUTED))
+        stats_row.addWidget(self._make_stat_card("SONGS", self.stat_songs_value, STAT_BLUE))
+        stats_row.addWidget(self._make_stat_card("AUDIOBOOKS", self.stat_audiobooks_value, STAT_PURPLE))
+        stats_row.addWidget(self._make_stat_card("PLAYLISTS", self.stat_playlists_value, GREEN))
+        stats_row.addWidget(self._make_stat_card("PLAYTIME", self.stat_playtime_value, STAT_AMBER))
+        stats_row.addWidget(self._make_stat_card("ARTISTS", self.stat_artists_value, ORANGE))
         layout.addLayout(stats_row)
 
         top_row = QHBoxLayout()
@@ -744,9 +1112,12 @@ class LibraryView(QWidget):
         settings_menu = QMenu(self)
         add_sources_action = QAction("ADD SOURCES...", self)
         add_sources_action.triggered.connect(self._open_migration_dialog)
+        add_files_action = QAction("ADD FILES...", self)
+        add_files_action.triggered.connect(self._open_add_files_dialog)
         export_action = QAction("EXPORT...", self)
         export_action.triggered.connect(self._open_export_dialog)
         settings_menu.addAction(add_sources_action)
+        settings_menu.addAction(add_files_action)
         settings_menu.addAction(export_action)
         settings_btn.setMenu(settings_menu)
         top_row.addWidget(settings_btn)
@@ -774,6 +1145,9 @@ class LibraryView(QWidget):
         self.audiobooks_list = make_track_list()
         self.songs_list.badgeClicked.connect(self._show_playlist_membership_menu)
         self.audiobooks_list.badgeClicked.connect(self._show_playlist_membership_menu)
+        self.songs_list.infoClicked.connect(self._show_track_info_by_id)
+        self.audiobooks_list.infoClicked.connect(self._show_track_info_by_id)
+        self.songs_list.itemDoubleClicked.connect(self._play_from_songs)  # music only — never audiobooks_list
         self.duplicates_list = QListWidget()
         self.unsorted_list = QListWidget()
 
@@ -781,6 +1155,7 @@ class LibraryView(QWidget):
         self.sub_tabs.addTab(self.audiobooks_list, "AUDIOBOOKS")
         self.sub_tabs.addTab(self.duplicates_list, "DUPLICATES")
         self.sub_tabs.addTab(self.unsorted_list, "UNSORTED")
+        self.sub_tabs.addTab(self._build_health_tab(), "HEALTH")
         layout.addWidget(self.sub_tabs, stretch=1)
 
         self.copy_actions = QWidget()
@@ -796,6 +1171,9 @@ class LibraryView(QWidget):
         copy_selected_btn = QPushButton("COPY SELECTED...")
         copy_selected_btn.clicked.connect(self._copy_selected_tracks)
         copy_row.addWidget(copy_selected_btn)
+        self.add_to_playlist_btn = QPushButton("ADD TO PLAYLIST...")
+        self.add_to_playlist_btn.clicked.connect(self._add_selected_to_playlist)
+        copy_row.addWidget(self.add_to_playlist_btn)
         layout.addWidget(self.copy_actions)
 
         self.dupe_actions = QWidget()
@@ -829,21 +1207,27 @@ class LibraryView(QWidget):
 
         self.refresh()
 
-    def _make_stat_card(self, label_text: str, value_label: QLabel, label_color: str) -> ChamferedFrame:
+    def _make_stat_card(self, label_text: str, value_label: QLabel, value_color: str) -> ChamferedFrame:
         frame = ChamferedFrame(chamfer=12)
         inner = QVBoxLayout(frame)
         inner.setContentsMargins(14, 12, 14, 12)
         inner.setSpacing(8)
-        inner.addWidget(PixelLabel(label_text, point_size=12, color=label_color, letter_spacing=2))
-        value_label.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {INK};")
+        # Label stays a uniform muted pixel caption — the color goes on the
+        # number itself instead, one distinct accent per card, so they're
+        # tellable apart at a glance without turning the labels into noise.
+        inner.addWidget(PixelLabel(label_text, point_size=12, color=MUTED, letter_spacing=2))
+        value_label.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {value_color};")
         inner.addWidget(value_label)
         return frame
 
     def _update_sub_tab_actions(self, index: int):
         self.sort_actions.setVisible(index in (0, 1))  # SONGS, AUDIOBOOKS
         self.copy_actions.setVisible(index in (0, 1))  # SONGS, AUDIOBOOKS
+        self.add_to_playlist_btn.setVisible(index == 0)  # SONGS only — playlists are a music-only concept
         self.dupe_actions.setVisible(index == 2)  # DUPLICATES
         self.unsorted_actions.setVisible(index == 3)  # UNSORTED
+        if index == HEALTH_TAB_INDEX:
+            self._refresh_health()
 
     def _on_sort_changed(self, field: str):
         self._sort_field = field
@@ -872,6 +1256,24 @@ class LibraryView(QWidget):
         dialog = LibraryMigrationDialog(self, library_root)
         dialog.exec()
         if dialog.build_succeeded:
+            self.refresh()
+
+    def _open_add_files_dialog(self):
+        library_root = self._get_library_root()
+        if not library_root:
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Choose or create a folder for your library", str(Path.home())
+            )
+            if not chosen:
+                return
+            library_root = chosen
+            self._set_library_root(library_root)
+            self._refresh_location_label()
+            self.libraryLocationChanged.emit(library_root)
+
+        dialog = AddFilesDialog(self, library_root)
+        dialog.exec()
+        if dialog.added_any:
             self.refresh()
 
     def _open_export_dialog(self):
@@ -996,6 +1398,27 @@ class LibraryView(QWidget):
             return
         CopyTracksDialog(self, library_root, paths).exec()
 
+    def _add_selected_to_playlist(self):
+        items = self.songs_list.selectedItems()  # Songs only — button is hidden on every other tab
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
+            return
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        track_ids = [item.data(Qt.ItemDataRole.UserRole)["id"] for item in items]
+        dialog = AddToPlaylistDialog(self, library_root, track_ids)
+        if dialog.exec() and dialog.added_count:
+            conn = libdb.open_db(library_root)
+            paths = libdb.playlist_track_paths_in_order(conn, dialog.target_playlist_id)
+            conn.close()
+            write_m3u8(str(Path(library_root) / "Playlists"), dialog.target_playlist_name, paths, library_root)
+            self.refresh()
+            QMessageBox.information(
+                self, "Added",
+                f"Added {dialog.added_count} track(s) to '{dialog.target_playlist_name}'.",
+            )
+
     def _edit_tags_selected_track(self):
         active_list = self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
         items = active_list.selectedItems()
@@ -1008,6 +1431,20 @@ class LibraryView(QWidget):
         data = items[0].data(Qt.ItemDataRole.UserRole)
         full_path = str(Path(library_root) / data["library_path"])
         self.fixTagsRequested.emit(full_path, data["id"])
+
+    def _show_track_info_by_id(self, track_id: int):
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        row = conn.execute("SELECT kind, library_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
+        conn.close()
+        if not row:
+            return
+        dialog = TrackInfoDialog(self, library_root, track_id, row["kind"])
+        dialog.exec()
+        if dialog.edit_tags_requested:
+            self.fixTagsRequested.emit(str(Path(library_root) / row["library_path"]), track_id)
 
     def _show_playlist_membership_menu(self, track_id: int, global_pos):
         library_root = self._get_library_root()
@@ -1025,6 +1462,26 @@ class LibraryView(QWidget):
                 lambda checked=False, pid=row["id"], name=row["name"]: self.playlistActivated.emit(pid, name)
             )
         menu.exec(global_pos)
+
+    def _play_from_songs(self, item: QListWidgetItem):
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        tracks = []
+        for i in range(self.songs_list.count()):
+            data = self.songs_list.item(i).data(Qt.ItemDataRole.UserRole)
+            tracks.append({
+                "id": data["id"],
+                "title": data["title"],
+                "artist": data["artist"],
+                "path": str(Path(library_root) / data["library_path"]),
+                "loudness_lufs": data.get("loudness_lufs"),
+                "loudness_true_peak": data.get("loudness_true_peak"),
+            })
+        self.playRequested.emit(tracks, self.songs_list.row(item))
+
+    def set_now_playing_track(self, track_id: int | None):
+        self.songs_list.set_playing_track(track_id)  # music only — audiobooks_list never plays
 
     def _remove_selected_tracks(self):
         active_list = self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
@@ -1124,6 +1581,219 @@ class LibraryView(QWidget):
         data = item.data(Qt.ItemDataRole.UserRole)
         self.fixTagsRequested.emit(data["path"], data["track_id"])
 
+    # ---- health dashboard ----
+
+    def _build_health_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        hint = QLabel(
+            "Checks your library for issues that can quietly accumulate — missing tags or art, "
+            "duplicates, and index entries that have gone stale against the files on disk."
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        header_row.addWidget(hint, stretch=1)
+        rescan_btn = QPushButton("RESCAN")
+        rescan_btn.clicked.connect(self._health_rescan)
+        header_row.addWidget(rescan_btn)
+        layout.addLayout(header_row)
+
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(10)
+        self.health_stat_values = {}
+        for label, color in [
+            ("DUPLICATES", GREEN),
+            ("MISSING TAGS", STAT_AMBER),
+            ("MISSING ART", STAT_PURPLE),
+            ("MISSING FILES", RED),
+            ("ORPHANED FILES", ORANGE),
+        ]:
+            value_label = QLabel("0")
+            self.health_stat_values[label] = value_label
+            stats_row.addWidget(self._make_stat_card(label, value_label, color))
+        layout.addLayout(stats_row)
+
+        category_row = QHBoxLayout()
+        category_label = QLabel("SHOW:")
+        category_label.setObjectName("muted")
+        category_row.addWidget(category_label)
+        self.health_category_combo = QComboBox()
+        self.health_category_combo.addItems(HEALTH_CATEGORIES)
+        self.health_category_combo.currentTextChanged.connect(self._on_health_category_changed)
+        category_row.addWidget(self.health_category_combo)
+        category_row.addStretch(1)
+        layout.addLayout(category_row)
+
+        self.health_list = QListWidget()
+        self.health_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.health_list, stretch=1)
+
+        self.health_fix_tags_btn = QPushButton("FIX TAGS")
+        self.health_fix_tags_btn.clicked.connect(self._health_fix_tags)
+        self.health_remove_btn = QPushButton("REMOVE FROM INDEX")
+        self.health_remove_btn.clicked.connect(self._health_remove_missing)
+        self.health_adopt_btn = QPushButton("FILE INTO LIBRARY")
+        self.health_adopt_btn.clicked.connect(self._health_file_orphans)
+        self.health_goto_dupes_btn = QPushButton("GO TO DUPLICATES")
+        self.health_goto_dupes_btn.clicked.connect(lambda: self.sub_tabs.setCurrentIndex(2))
+
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        action_row.addWidget(self.health_fix_tags_btn)
+        action_row.addWidget(self.health_remove_btn)
+        action_row.addWidget(self.health_adopt_btn)
+        action_row.addWidget(self.health_goto_dupes_btn)
+        layout.addLayout(action_row)
+
+        self._health_data = {c: [] for c in HEALTH_CATEGORIES}
+        self._on_health_category_changed(self.health_category_combo.currentText())
+        return tab
+
+    def _on_health_category_changed(self, category: str):
+        self.health_fix_tags_btn.setVisible(category in ("Missing Tags", "Missing Art"))
+        self.health_remove_btn.setVisible(category == "Missing Files")
+        self.health_adopt_btn.setVisible(category == "Orphaned Files")
+        self.health_goto_dupes_btn.setVisible(category == "Duplicates")
+        self._populate_health_list(category)
+
+    def _populate_health_list(self, category: str):
+        self.health_list.clear()
+        for entry in self._health_data.get(category, []):
+            item = QListWidgetItem(entry["label"])
+            item.setData(Qt.ItemDataRole.UserRole, entry["data"])
+            self.health_list.addItem(item)
+
+    def _refresh_health(self):
+        """Computes all 5 categories in one pass. Deliberately NOT part of
+        refresh() (which reruns on every 200ms search-debounce keystroke) —
+        the filesystem-walk-based checks here (Path.exists() per track,
+        rglob over Music/Audiobooks) would make typing in search laggy if
+        coupled to that hot path. Only called lazily on switching into this
+        tab, or via the RESCAN button."""
+        library_root = self._get_library_root()
+        if not library_root or not Path(library_root).exists():
+            self._health_data = {c: [] for c in HEALTH_CATEGORIES}
+            for value_label in self.health_stat_values.values():
+                value_label.setText("0")
+            self._populate_health_list(self.health_category_combo.currentText())
+            return
+
+        conn = libdb.open_db(library_root)
+
+        dupe_entries = []
+        for d in libdb.list_unresolved_fuzzy_dupes(conn):
+            a = conn.execute("SELECT * FROM tracks WHERE id = ?", (d["track_id_a"],)).fetchone()
+            b = conn.execute("SELECT * FROM tracks WHERE id = ?", (d["track_id_b"],)).fetchone()
+            if not a or not b:
+                continue
+            dupe_entries.append({"label": f"{a['title']} — {a['artist']}", "data": d["id"]})
+
+        music_tracks = libdb.list_tracks(conn, "music")
+        filed_music = [t for t in music_tracks if not _is_unsorted(t["library_path"])]
+        tag_entries = [
+            {"label": f"{t['title'] or Path(t['library_path']).stem}  —  {t['library_path']}",
+             "data": {"path": str(Path(library_root) / t["library_path"]), "track_id": t["id"]}}
+            for t in _find_missing_tags(filed_music)
+        ]
+        art_entries = [
+            {"label": f"{t['title'] or Path(t['library_path']).stem}  —  {t['library_path']}",
+             "data": {"path": str(Path(library_root) / t["library_path"]), "track_id": t["id"]}}
+            for t in libdb.tracks_flagged_no_art(conn) if not _is_unsorted(t["library_path"])
+        ]
+
+        all_tracks = libdb.list_tracks(conn)
+        missing_entries = [
+            {"label": f"{t['title'] or Path(t['library_path']).stem}  —  {t['library_path']}",
+             "data": {"track_id": t["id"], "library_path": t["library_path"]}}
+            for t in _find_missing_files(library_root, all_tracks)
+        ]
+
+        known_paths = {t["library_path"] for t in all_tracks}
+        orphan_entries = [
+            {"label": rel_path, "data": {"abs_path": str(Path(library_root) / rel_path), "kind": kind}}
+            for rel_path, kind in _find_orphaned_files(library_root, known_paths)
+        ]
+        conn.close()
+
+        self._health_data = {
+            "Duplicates": dupe_entries,
+            "Missing Tags": tag_entries,
+            "Missing Art": art_entries,
+            "Missing Files": missing_entries,
+            "Orphaned Files": orphan_entries,
+        }
+        self.health_stat_values["DUPLICATES"].setText(str(len(dupe_entries)))
+        self.health_stat_values["MISSING TAGS"].setText(str(len(tag_entries)))
+        self.health_stat_values["MISSING ART"].setText(str(len(art_entries)))
+        self.health_stat_values["MISSING FILES"].setText(str(len(missing_entries)))
+        self.health_stat_values["ORPHANED FILES"].setText(str(len(orphan_entries)))
+        self._populate_health_list(self.health_category_combo.currentText())
+
+    def refresh_health_if_active(self):
+        """Called by MainWindow after the background art-check worker
+        finishes, so Missing Art counts live-update if the user is already
+        looking at this tab — without polling."""
+        if self.sub_tabs.currentIndex() == HEALTH_TAB_INDEX:
+            self._refresh_health()
+
+    def _health_rescan(self):
+        self._refresh_health()
+        self.healthRescanRequested.emit()
+
+    def _health_fix_tags(self):
+        item = self.health_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Nothing selected", "Click a track in the list first.")
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        self.fixTagsRequested.emit(data["path"], data["track_id"])
+
+    def _health_remove_missing(self):
+        items = self.health_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more entries first.")
+            return
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        affected_playlist_ids = set()
+        for item in items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            track_id = data["track_id"]
+            affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
+            libdb.delete_track(conn, track_id)  # file's already gone — no unlink needed
+        for playlist_id in affected_playlist_ids:
+            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+            if row:
+                paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+                write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
+        conn.close()
+        self.refresh()
+        self._refresh_health()
+
+    def _health_file_orphans(self):
+        items = self.health_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more entries first.")
+            return
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        added = 0
+        for item in items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            _, status = adopt_orphan_file(library_root, data["abs_path"], data["kind"])
+            if status == "added":
+                added += 1
+        self.refresh()
+        self._refresh_health()
+        QMessageBox.information(self, "Filed", f"Added {added} of {len(items)} file(s) to the library.")
+
 
 class AddTracksDialog(QDialog):
     """Search + multi-select existing library tracks to add to a playlist.
@@ -1194,6 +1864,95 @@ class AddTracksDialog(QDialog):
         self.accept()
 
 
+class AddToPlaylistDialog(QDialog):
+    """Pick an existing playlist (or create a new one on the fly) to add
+    already-selected library tracks to — the inverse of AddTracksDialog
+    (that one searches the library from inside a playlist; this searches
+    playlists from inside the library). Same division of labor as
+    AddTracksDialog: only mutates playlist_tracks here — the caller rewrites
+    the affected .m3u8 afterward, since it already owns that logic for every
+    other playlist mutation."""
+
+    def __init__(self, parent, library_root: str, track_ids: list[int]):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.track_ids = track_ids
+        self.added_count = 0
+        self.target_playlist_id = None
+        self.target_playlist_name = None
+        self.setWindowTitle(f"Add {len(track_ids)} Track(s) to Playlist")
+        self.resize(360, 420)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(f"Add {len(track_ids)} track(s) to a playlist.")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget, stretch=1)
+
+        new_row = QHBoxLayout()
+        self.new_name_edit = QLineEdit()
+        self.new_name_edit.setPlaceholderText("New playlist name...")
+        new_btn = QPushButton("+ CREATE")
+        new_btn.clicked.connect(self._create_and_add)
+        new_row.addWidget(self.new_name_edit, stretch=1)
+        new_row.addWidget(new_btn)
+        layout.addLayout(new_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel_btn = QPushButton("CANCEL")
+        cancel_btn.clicked.connect(self.reject)
+        add_btn = QPushButton("ADD")
+        add_btn.setObjectName("primary")
+        add_btn.clicked.connect(self._add_to_selected)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(add_btn)
+        layout.addLayout(btn_row)
+
+        conn = libdb.open_db(library_root)
+        for p in libdb.list_playlists(conn):
+            item = QListWidgetItem(p["name"])
+            item.setData(Qt.ItemDataRole.UserRole, p["id"])
+            self.list_widget.addItem(item)
+        conn.close()
+
+    def _add_tracks_to(self, playlist_id: int, name: str):
+        conn = libdb.open_db(self.library_root)
+        existing_ids = libdb.playlist_track_ids(conn, playlist_id)
+        position = libdb.next_playlist_position(conn, playlist_id)
+        added = 0
+        for track_id in self.track_ids:
+            if track_id in existing_ids:
+                continue
+            libdb.add_playlist_track(conn, playlist_id, track_id, position)
+            position += 1
+            added += 1
+        conn.close()
+        self.added_count = added
+        self.target_playlist_id = playlist_id
+        self.target_playlist_name = name
+        self.accept()
+
+    def _add_to_selected(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Nothing selected", "Select a playlist, or create a new one below.")
+            return
+        self._add_tracks_to(item.data(Qt.ItemDataRole.UserRole), item.text())
+
+    def _create_and_add(self):
+        name = self.new_name_edit.text().strip()
+        if not name:
+            QMessageBox.information(self, "Name required", "Enter a name for the new playlist.")
+            return
+        conn = libdb.open_db(self.library_root)
+        playlist_id = libdb.get_or_create_playlist(conn, name)
+        conn.close()
+        self._add_tracks_to(playlist_id, name)
+
+
 class PlaylistView(QWidget):
     """Editable view of one playlist: drag to reorder, add tracks from the
     library, remove tracks, delete the whole playlist. Every mutation
@@ -1202,6 +1961,7 @@ class PlaylistView(QWidget):
 
     playlistsChanged = pyqtSignal()  # tells MainWindow to refresh the sidebar deck / library counts
     fixTagsRequested = pyqtSignal(str, int)  # mp3 path, track_id — same contract as LibraryView's
+    playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path), start index — same contract as LibraryView's
 
     def __init__(self, get_library_root):
         super().__init__()
@@ -1235,6 +1995,9 @@ class PlaylistView(QWidget):
         add_btn = QPushButton("ADD TRACKS...")
         add_btn.clicked.connect(self._open_add_tracks_dialog)
         top_row.addWidget(add_btn)
+        add_files_btn = QPushButton("ADD FILES...")
+        add_files_btn.clicked.connect(self._open_add_files_dialog)
+        top_row.addWidget(add_files_btn)
         top_row.addStretch(1)
 
         settings_btn = QPushButton("⚙")
@@ -1269,12 +2032,14 @@ class PlaylistView(QWidget):
         hint.setObjectName("muted")
         layout.addWidget(hint)
 
-        self.track_list = QListWidget()
+        self.track_list = TrackListWidget()
         self.track_list.setItemDelegate(TrackRowDelegate(self.track_list))
         self.track_list.setMouseTracking(True)
         self.track_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.track_list.model().rowsMoved.connect(lambda *a: self._persist_order())
+        self.track_list.itemDoubleClicked.connect(self._play_from_playlist)
+        self.track_list.infoClicked.connect(self._show_track_info_by_id)
         layout.addWidget(self.track_list, stretch=1)
 
     def show_playlist(self, playlist_id: int, name: str):
@@ -1311,6 +2076,8 @@ class PlaylistView(QWidget):
                     "title": row["title"] or Path(path).stem,
                     "artist": row["artist"] or "",
                     "badge": None,  # playlist order is the point here, not membership count
+                    "loudness_lufs": row["loudness_lufs"],
+                    "loudness_true_peak": row["loudness_true_peak"],
                 })
                 self.track_list.addItem(item)
                 total_seconds += row["duration_seconds"] or 0.0
@@ -1387,6 +2154,40 @@ class PlaylistView(QWidget):
         full_path = str(Path(library_root) / data["library_path"])
         self.fixTagsRequested.emit(full_path, data["id"])
 
+    def _show_track_info_by_id(self, track_id: int):
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        row = conn.execute("SELECT kind, library_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
+        conn.close()
+        if not row:
+            return
+        dialog = TrackInfoDialog(self, library_root, track_id, row["kind"])
+        dialog.exec()
+        if dialog.edit_tags_requested:
+            self.fixTagsRequested.emit(str(Path(library_root) / row["library_path"]), track_id)
+
+    def _play_from_playlist(self, item: QListWidgetItem):
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        tracks = []
+        for i in range(self.track_list.count()):
+            data = self.track_list.item(i).data(Qt.ItemDataRole.UserRole)
+            tracks.append({
+                "id": data["id"],
+                "title": data["title"],
+                "artist": data["artist"],
+                "path": str(Path(library_root) / data["library_path"]),
+                "loudness_lufs": data.get("loudness_lufs"),
+                "loudness_true_peak": data.get("loudness_true_peak"),
+            })
+        self.playRequested.emit(tracks, self.track_list.row(item))
+
+    def set_now_playing_track(self, track_id: int | None):
+        self.track_list.set_playing_track(track_id)
+
     def _choose_artwork(self):
         if self._playlist_id is None:
             return
@@ -1422,6 +2223,21 @@ class PlaylistView(QWidget):
         dialog = AddTracksDialog(self, library_root, self._playlist_id)
         if dialog.exec() and dialog.added_count:
             self._write_current_m3u8(library_root)
+            self.refresh()
+            self.playlistsChanged.emit()
+
+    def _open_add_files_dialog(self):
+        if self._playlist_id is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            QMessageBox.information(self, "No library yet", "Add sources and build your library first.")
+            return
+        dialog = AddFilesDialog(self, library_root, default_playlist_id=self._playlist_id, lock_to_music=True)
+        dialog.exec()
+        if dialog.added_any:
+            # AddFilesWorker already writes the target playlist's .m3u8
+            # itself (batched, once) — no _write_current_m3u8 call needed here.
             self.refresh()
             self.playlistsChanged.emit()
 

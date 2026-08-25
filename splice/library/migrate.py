@@ -11,7 +11,7 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..widgets import natural_sort_key
-from ..workers import unique_path
+from ..workers import ts, unique_path
 from . import db as libdb
 from . import naming
 from .playlists import write_m3u8
@@ -148,6 +148,99 @@ def file_single_track(library_root: str, source_path: str, kind: str = "music") 
         return track_id, "added"
     finally:
         conn.close()
+
+
+def adopt_orphan_file(library_root: str, abs_path: str, kind: str = "music") -> tuple[int | None, str]:
+    """Indexes a file that's already sitting inside Library/Music or
+    Library/Audiobooks but has no tracks row (the Health dashboard's
+    "orphaned files" case) — reads/hashes/dedup-checks exactly like
+    file_single_track, but never copies or relocates the file: it's already
+    in the right place, only the index row is missing. Deliberately not a
+    reuse of file_single_track, which always computes a fresh destination via
+    naming.*_destination() and copies there — for a file already inside the
+    library that would create a redundant duplicate copy instead of just
+    adopting the original in place."""
+    scanned, reason = read_scan_info(abs_path)
+    if scanned is None:
+        return None, reason
+
+    conn = libdb.open_db(library_root)
+    try:
+        existing = libdb.find_by_hash(conn, scanned.hash)
+        if existing is not None:
+            return None, "already_in_library"
+
+        library_path = Path(abs_path).relative_to(library_root).as_posix()
+        fuzzy_matches = libdb.find_by_normalized_title_artist(conn, scanned.title, scanned.artist) if kind == "music" else []
+        track_id = libdb.insert_track(
+            conn, file_hash=scanned.hash, library_path=library_path, kind=kind,
+            title=scanned.title, artist=scanned.artist, album=scanned.album,
+            date=scanned.date, tracknumber=scanned.tracknumber,
+            duration_seconds=scanned.duration_seconds,
+        )
+        for match in fuzzy_matches:
+            libdb.add_fuzzy_dupe(conn, track_id, match["id"], "same normalized title+artist")
+        return track_id, "added"
+    finally:
+        conn.close()
+
+
+class AddFilesWorker(QThread):
+    """Files a batch of externally-picked mp3s into the library — same
+    per-file call (file_single_track) YouTube downloads and the Merge
+    handoff already use, just looped over a user-picked file list. Adds
+    every successfully-filed track to one playlist at the end (a single
+    batched write_m3u8, not one per file) rather than per-file, since a
+    whole picked batch commonly targets the same playlist."""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(int)  # count actually added (excludes already-in-library/failed)
+    cancelled = pyqtSignal()
+
+    def __init__(self, library_root: str, file_paths: list[str], kind: str, playlist_id: int | None = None):
+        super().__init__()
+        self.library_root = library_root
+        self.file_paths = file_paths
+        self.kind = kind
+        self.playlist_id = playlist_id
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+
+    def run(self):
+        added_track_ids = []
+        total = len(self.file_paths)
+        for i, path in enumerate(self.file_paths, start=1):
+            if self._cancel_requested:
+                self.cancelled.emit()
+                return
+            self.progress.emit(int(i / total * 100) if total else 100)
+            track_id, status = file_single_track(self.library_root, path, kind=self.kind)
+            if track_id is None:
+                self.log.emit(f"[{ts()}] Could not add {Path(path).name}: {status}")
+                continue
+            if status == "added":
+                self.log.emit(f"[{ts()}] Added: {Path(path).name}")
+                added_track_ids.append(track_id)
+            else:
+                self.log.emit(f"[{ts()}] Already in library: {Path(path).name}")
+
+        if added_track_ids and self.kind == "music" and self.playlist_id is not None:
+            conn = libdb.open_db(self.library_root)
+            position = libdb.next_playlist_position(conn, self.playlist_id)
+            for track_id in added_track_ids:
+                libdb.add_playlist_track(conn, self.playlist_id, track_id, position)
+                position += 1
+            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (self.playlist_id,)).fetchone()
+            paths = libdb.playlist_track_paths_in_order(conn, self.playlist_id)
+            conn.close()
+            if row:
+                write_m3u8(str(Path(self.library_root) / "Playlists"), row["name"], paths, self.library_root)
+                self.log.emit(f"[{ts()}] Added {len(added_track_ids)} track(s) to playlist: {row['name']}")
+
+        self.finished_ok.emit(len(added_track_ids))
 
 
 class LibraryScanWorker(QThread):

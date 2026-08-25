@@ -34,9 +34,17 @@ CONSOLE = "#E7E8EA"      # input/log "well" — same as chassis, reads as recess
 INK = "#1C1E22"          # near-black text
 MUTED = "#5E636A"        # mid grey for secondary text
 BORDER = "#CBCED3"       # soft grey border
-ORANGE = "#FF4F30"       # primary + active/selected accent
+ORANGE = "#FF4F30"       # primary + active/selected accent — the only *interactive* accent
 GREEN = "#1E9E63"        # success — deepened for legibility on a light background
 RED = "#D93A2B"          # true error state — distinct from the accent
+
+# Categorical accents for the Library stat row's numbers — decorative/
+# informational only, never used on anything clickable, so they don't
+# compete with ORANGE's job as the single interactive accent. Muted enough
+# to sit quietly on the light grey chassis rather than fight it.
+STAT_BLUE = "#3B6FA6"
+STAT_PURPLE = "#7A5CB8"
+STAT_AMBER = "#C98A1F"
 
 RADIUS = 3
 RADIUS_SM = 2
@@ -251,5 +259,55 @@ QMenu::separator {{
     height: 1px;
     background: {BORDER};
     margin: 4px 6px;
+}}
+QWidget#nowPlayingBar {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+}}
+QLabel#nowPlayingTitle {{
+    font-weight: bold;
+    color: {INK};
+}}
+QFrame#consoleStrip {{
+    background-color: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: {RADIUS}px;
+}}
+QFrame#consoleStrip:hover {{
+    border-color: {ORANGE};
+}}
+QPushButton:checked {{
+    background-color: {ORANGE};
+    color: #FFFFFF;
+    border: none;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {BORDER};
+    border-radius: 2px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {ORANGE};
+    border-radius: 2px;
+}}
+QSlider::add-page:horizontal {{
+    background: {BORDER};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {SURFACE};
+    border: 2px solid {ORANGE};
+    width: 12px;
+    height: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: {ORANGE};
+}}
+QSlider:disabled::groove:horizontal, QSlider:disabled::handle:horizontal {{
+    border-color: {BORDER};
+    background: {BORDER};
 }}
 """

@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS tracks (
     kind TEXT NOT NULL,
     title TEXT, artist TEXT, album TEXT, date TEXT, tracknumber TEXT,
     duration_seconds REAL,
-    added_at TEXT NOT NULL
+    added_at TEXT NOT NULL,
+    loudness_lufs REAL,
+    loudness_true_peak REAL
 );
 CREATE TABLE IF NOT EXISTS playlists (
     id INTEGER PRIMARY KEY,
@@ -41,6 +43,29 @@ def db_path(library_root: str) -> Path:
     return Path(library_root) / ".splice" / "index.db"
 
 
+def _ensure_loudness_columns(conn: sqlite3.Connection):
+    """SCHEMA's CREATE TABLE IF NOT EXISTS is a no-op against an already-
+    existing tracks table, so it alone can't retrofit new columns onto a
+    library indexed before this feature existed — this is the first time
+    this app has needed a real column migration (every past schema change
+    added a whole new table instead)."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tracks)")}
+    if "loudness_lufs" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN loudness_lufs REAL")
+    if "loudness_true_peak" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN loudness_true_peak REAL")
+    conn.commit()
+
+
+def _ensure_health_columns(conn: sqlite3.Connection):
+    """Same retrofit-migration pattern as _ensure_loudness_columns, for the
+    library-health dashboard's cached art-presence flag."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tracks)")}
+    if "has_art" not in cols:
+        conn.execute("ALTER TABLE tracks ADD COLUMN has_art INTEGER")
+    conn.commit()
+
+
 def open_db(library_root: str) -> sqlite3.Connection:
     path = db_path(library_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +74,8 @@ def open_db(library_root: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     conn.commit()
+    _ensure_loudness_columns(conn)
+    _ensure_health_columns(conn)
     return conn
 
 
@@ -235,3 +262,31 @@ def delete_track(conn: sqlite3.Connection, track_id: int):
     conn.execute("DELETE FROM fuzzy_dupes WHERE track_id_a = ? OR track_id_b = ?", (track_id, track_id))
     conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
     conn.commit()
+
+
+def set_track_loudness(conn: sqlite3.Connection, track_id: int, lufs: float, true_peak: float):
+    conn.execute(
+        "UPDATE tracks SET loudness_lufs = ?, loudness_true_peak = ? WHERE id = ?",
+        (lufs, true_peak, track_id),
+    )
+    conn.commit()
+
+
+def tracks_missing_loudness(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT id, library_path, kind FROM tracks WHERE loudness_lufs IS NULL").fetchall()
+
+
+def set_track_art_flag(conn: sqlite3.Connection, track_id: int, has_art: bool):
+    conn.execute("UPDATE tracks SET has_art = ? WHERE id = ?", (1 if has_art else 0, track_id))
+    conn.commit()
+
+
+def tracks_missing_art_check(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Feeds the background HealthScanWorker — rows never yet checked."""
+    return conn.execute("SELECT id, library_path FROM tracks WHERE kind = 'music' AND has_art IS NULL").fetchall()
+
+
+def tracks_flagged_no_art(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Feeds the Health dashboard — rows checked and confirmed missing art.
+    Caller filters out _Unsorted paths (a separate, already-surfaced problem)."""
+    return conn.execute("SELECT * FROM tracks WHERE kind = 'music' AND has_art = 0").fetchall()

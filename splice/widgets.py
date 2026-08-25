@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -17,15 +17,20 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
     QSizePolicy,
+    QSlider,
     QStyle,
     QStyledItemDelegate,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -605,18 +610,37 @@ class TrackRowDelegate(QStyledItemDelegate):
 
     ROW_HEIGHT = 46
     PADDING_X = 14
+    INFO_ICON_SIZE = 20
+
+    @staticmethod
+    def _badge_width(base_font: QFont, badge: str | None) -> int:
+        if not badge:
+            return 0
+        badge_font = _resized_font(base_font, -1)
+        return QFontMetrics(badge_font).horizontalAdvance(badge) + 16
 
     @staticmethod
     def badge_rect(row_rect: QRect, base_font: QFont, badge: str) -> QRect:
         """Rect of the badge pill within a row — shared by paint() and
         TrackListWidget's click hit-testing so the two can never disagree
         about where the pill actually is."""
-        badge_font = _resized_font(base_font, -1)
-        badge_width = QFontMetrics(badge_font).horizontalAdvance(badge) + 16
+        badge_width = TrackRowDelegate._badge_width(base_font, badge)
         return QRect(
             row_rect.right() - TrackRowDelegate.PADDING_X - badge_width,
             row_rect.center().y() - 10, badge_width, 20,
         )
+
+    @staticmethod
+    def info_icon_rect(row_rect: QRect, base_font: QFont, badge: str | None) -> QRect:
+        """Rect of the small circular INFO icon — sits just left of the
+        badge pill (or where the badge would be, if there is none). Shared
+        by paint() and TrackListWidget's click hit-testing, same rationale
+        as badge_rect."""
+        badge_width = TrackRowDelegate._badge_width(base_font, badge)
+        reserved = badge_width + 8 if badge else 0  # same 8px gap paint() uses before the badge
+        right_edge = row_rect.right() - TrackRowDelegate.PADDING_X - reserved
+        size = TrackRowDelegate.INFO_ICON_SIZE
+        return QRect(right_edge - size - 6, row_rect.center().y() - size // 2, size, size)
 
     def paint(self, painter: QPainter, option, index):
         painter.save()
@@ -630,6 +654,12 @@ class TrackRowDelegate(QStyledItemDelegate):
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        # Read at paint time rather than baking a "now_playing" flag into
+        # each item's dict at populate time — the latter would go stale the
+        # instant a different track starts playing, without a full
+        # repopulate. self.parent() is the owning TrackListWidget for free
+        # (passed as this delegate's QObject parent at construction).
+        playing = bool(data.get("id")) and data.get("id") == getattr(self.parent(), "_playing_id", None)
 
         if selected:
             painter.setPen(Qt.PenStyle.NoPen)
@@ -642,27 +672,47 @@ class TrackRowDelegate(QStyledItemDelegate):
             painter.setBrush(tint)
             painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
 
-        text_color = QColor("#FFFFFF") if selected else QColor(INK)
+        if playing and not selected:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(ORANGE))
+            painter.drawRoundedRect(QRect(rect.left() + 2, rect.top() + 6, 3, rect.height() - 12), 1, 1)
+
+        text_color = QColor("#FFFFFF") if selected else QColor(ORANGE) if playing else QColor(INK)
         muted_color = QColor("#FFFFFF") if selected else QColor(MUTED)
 
-        badge_width = 0
+        badge_width = self._badge_width(option.font, badge)
         if badge:
-            badge_font = _resized_font(option.font, -1)
-            painter.setFont(badge_font)
-            text_w = painter.fontMetrics().horizontalAdvance(badge)
-            badge_width = text_w + 16
             badge_rect = QRect(
                 rect.right() - self.PADDING_X - badge_width, rect.center().y() - 10, badge_width, 20
             )
             pen_color = QColor("#FFFFFF") if selected else QColor(ORANGE)
+            badge_font = _resized_font(option.font, -1)
+            painter.setFont(badge_font)
             painter.setPen(QPen(pen_color, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(badge_rect, 9, 9)
             painter.setPen(pen_color)
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge)
 
+        info_rect = self.info_icon_rect(rect, option.font, badge)
+        icon_color = QColor("#FFFFFF") if selected else QColor(ORANGE)
+        painter.setPen(QPen(icon_color, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(info_rect)
+        # Drawn as vector lines rather than a font-rendered character — a
+        # font-rendered "i" read as a "1" at this size regardless of font,
+        # same "don't trust a small glyph, paint it yourself" fix
+        # TransportButton's media icons used.
+        cx, cy = info_rect.center().x(), info_rect.center().y()
+        plus_pen = QPen(icon_color, 1.6)
+        plus_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(plus_pen)
+        half = 4.0
+        painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+        painter.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
+
         text_left = rect.left() + self.PADDING_X
-        text_right = rect.right() - self.PADDING_X - (badge_width + 8 if badge else 0)
+        text_right = info_rect.left() - 8
         title_rect = QRect(text_left, rect.top() + 6, max(0, text_right - text_left), 20)
         artist_rect = QRect(text_left, rect.top() + 24, max(0, text_right - text_left), 18)
 
@@ -695,12 +745,52 @@ class TrackListWidget(QListWidget):
     letting the click fall through to normal row selection."""
 
     badgeClicked = pyqtSignal(int, QPoint)
+    infoClicked = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self._playing_id: int | None = None
+
+    def set_playing_track(self, track_id: int | None):
+        """track_id of the row to paint with the now-playing accent, or None
+        to clear it. Just a repaint — TrackRowDelegate reads this back via
+        self.parent() at paint time, no per-item data to update."""
+        self._playing_id = track_id
+        self.viewport().update()
+
+    def _badge_hit(self, pos) -> bool:
+        item = self.itemAt(pos)
+        if item is None:
+            return False
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        badge = data.get("badge")
+        if not badge:
+            return False
+        rect = TrackRowDelegate.badge_rect(self.visualItemRect(item), self.font(), badge)
+        return rect.contains(pos)
+
+    def _info_hit(self, pos) -> bool:
+        item = self.itemAt(pos)
+        if item is None:
+            return False
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        if not data.get("id"):
+            return False
+        rect = TrackRowDelegate.info_icon_rect(self.visualItemRect(item), self.font(), data.get("badge"))
+        return rect.contains(pos)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.pos())
             if item is not None:
                 data = item.data(Qt.ItemDataRole.UserRole) or {}
+                if data.get("id") is not None:
+                    info_rect = TrackRowDelegate.info_icon_rect(
+                        self.visualItemRect(item), self.font(), data.get("badge")
+                    )
+                    if info_rect.contains(event.pos()):
+                        self.infoClicked.emit(data["id"])
+                        return
                 badge = data.get("badge")
                 if badge:
                     rect = TrackRowDelegate.badge_rect(self.visualItemRect(item), self.font(), badge)
@@ -708,3 +798,350 @@ class TrackListWidget(QListWidget):
                         self.badgeClicked.emit(data["id"], event.globalPosition().toPoint())
                         return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        # Without this, double-clicking exactly on the badge pill or the info
+        # icon would both trigger their single-click handler above and fire
+        # itemDoubleClicked (play) at the same instant, since Qt delivers
+        # both a press and a double-click event for one gesture.
+        if event.button() == Qt.MouseButton.LeftButton and (self._badge_hit(event.pos()) or self._info_hit(event.pos())):
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+def _format_ms(ms: int) -> str:
+    """M:SS for a player position/duration in milliseconds. Distinct from
+    library_view.py's _format_duration (that one formats DB seconds, and
+    library_view.py imports from this file, not the reverse)."""
+    total_seconds = max(0, int(ms // 1000))
+    return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+
+class ConsoleStrip(QFrame):
+    """Thin clickable status strip — the console's collapsed state. QFrame
+    has no built-in click signal, so mousePressEvent is overridden to emit
+    one, same pattern ChamferedArtTile uses for its own click affordance."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("consoleStrip")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 5, 10, 5)
+        row.setSpacing(8)
+        self.status_dot = StatusDot()
+        self.status_label = QLabel("STANDBY")
+        self.status_label.setObjectName("muted")
+        # Separate from status_dot/status_label on purpose — those are the
+        # single shared indicator Merge/Split/Tags treat as mutually
+        # exclusive ("one busy thing at a time"). Background loudness
+        # analysis can run for a long time alongside any of those, so it
+        # gets its own lane here instead of fighting over the shared one —
+        # same reasoning that gave YouTube downloads their own progress
+        # widget rather than sharing this strip too.
+        self.task_label = QLabel("")
+        self.task_label.setObjectName("muted")
+        self._hint = QLabel("CLICK TO EXPAND ▴")
+        self._hint.setObjectName("muted")
+        row.addWidget(self.status_dot)
+        row.addWidget(self.status_label)
+        row.addWidget(self.task_label)
+        row.addStretch(1)
+        row.addWidget(self._hint)
+
+    def set_status(self, state: str, text: str):
+        self.status_dot.set_state(state)
+        self.status_label.setText(text)
+
+    def set_task_text(self, text: str):
+        self.task_label.setText(text)
+
+    def set_expanded(self, expanded: bool):
+        self._hint.setText("CLICK TO COLLAPSE ▾" if expanded else "CLICK TO EXPAND ▴")
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            return
+        super().mousePressEvent(event)
+
+
+class TransportButton(QAbstractButton):
+    """A playback control (play/pause/prev/next/shuffle) drawn as a flat
+    vector shape via QPainter, instead of a Unicode glyph — media symbols
+    (▶⏸⏮⏭⇄) render inconsistently (mismatched weight, sometimes an ugly
+    fallback glyph) depending on what fonts happen to be installed. Same
+    custom-paint idiom RailButton/LevelGauge/StatusDot already use elsewhere
+    in this file, so this always matches Direction E exactly regardless of
+    the machine."""
+
+    def __init__(self, icon: str, checkable: bool = False, size: tuple[int, int] = (30, 26)):
+        super().__init__()
+        self._icon = icon
+        self._hovering = False
+        self.setCheckable(checkable)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(*size)
+
+    def set_icon(self, icon: str):
+        self._icon = icon
+        self.update()
+
+    def enterEvent(self, event):
+        self._hovering = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+
+        if not self.isEnabled():
+            bg, border, icon_color = QColor(SURFACE), QColor(BORDER), QColor(BORDER)
+        elif self.isChecked():
+            bg = QColor(ORANGE)
+            bg.setAlpha(28)
+            border = QColor(ORANGE)
+            icon_color = QColor(ORANGE)
+        elif self._hovering:
+            bg, border, icon_color = QColor(SURFACE), QColor(ORANGE), QColor(ORANGE)
+        else:
+            bg, border, icon_color = QColor(SURFACE), QColor(BORDER), QColor(INK)
+
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(icon_color)
+        self._draw_glyph(painter, rect, icon_color)
+        painter.end()
+
+    def _draw_glyph(self, painter: QPainter, rect: QRect, color: QColor):
+        margin_x = rect.width() * 0.28
+        margin_y = rect.height() * 0.2
+        bx, by = rect.left() + margin_x, rect.top() + margin_y
+        bw, bh = rect.width() - 2 * margin_x, rect.height() - 2 * margin_y
+
+        if self._icon == "play":
+            self._triangle(painter, bx, by, bw, bh, pointing_right=True)
+        elif self._icon == "pause":
+            bar_w = bw * 0.34
+            gap = bw - 2 * bar_w
+            painter.drawRect(QRectF(bx, by, bar_w, bh))
+            painter.drawRect(QRectF(bx + bar_w + gap, by, bar_w, bh))
+        elif self._icon == "next":
+            tri_w = bw * 0.64
+            bar_w = bw - tri_w - bw * 0.1
+            self._triangle(painter, bx, by, tri_w, bh, pointing_right=True)
+            painter.drawRect(QRectF(bx + bw - bar_w, by, bar_w, bh))
+        elif self._icon == "prev":
+            tri_w = bw * 0.64
+            bar_w = bw - tri_w - bw * 0.1
+            painter.drawRect(QRectF(bx, by, bar_w, bh))
+            self._triangle(painter, bx + bar_w + bw * 0.1, by, tri_w, bh, pointing_right=False)
+        elif self._icon == "shuffle":
+            self._shuffle_glyph(painter, bx, by, bw, bh, color)
+
+    @staticmethod
+    def _triangle(painter: QPainter, x: float, y: float, w: float, h: float, pointing_right: bool):
+        path = QPainterPath()
+        if pointing_right:
+            path.moveTo(x, y)
+            path.lineTo(x, y + h)
+            path.lineTo(x + w, y + h / 2)
+        else:
+            path.moveTo(x + w, y)
+            path.lineTo(x + w, y + h)
+            path.lineTo(x, y + h / 2)
+        path.closeSubpath()
+        painter.drawPath(path)
+
+    @staticmethod
+    def _shuffle_glyph(painter: QPainter, x: float, y: float, w: float, h: float, color: QColor):
+        # Straight crossing lines read as a plain X regardless of how their
+        # lengths are staggered — a curve is what actually sells "two paths
+        # swapping places" instead of "multiplication sign". Two flowing
+        # S-curves, each ending in a right-pointing arrowhead.
+        pen = QPen(color, 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        tip_top = (x + w * 0.88, y + h * 0.14)
+        tip_bottom = (x + w * 0.88, y + h * 0.86)
+
+        upper = QPainterPath()
+        upper.moveTo(x, y + h * 0.78)
+        upper.cubicTo(x + w * 0.4, y + h * 0.78, x + w * 0.4, y + h * 0.22, tip_top[0], tip_top[1])
+        painter.drawPath(upper)
+
+        lower = QPainterPath()
+        lower.moveTo(x, y + h * 0.22)
+        lower.cubicTo(x + w * 0.4, y + h * 0.22, x + w * 0.4, y + h * 0.78, tip_bottom[0], tip_bottom[1])
+        painter.drawPath(lower)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        for ex, ey in (tip_top, tip_bottom):
+            arrow = QPainterPath()
+            arrow.moveTo(ex - 6, ey - 4.5)
+            arrow.lineTo(ex + 3, ey)
+            arrow.lineTo(ex - 6, ey + 4.5)
+            arrow.closeSubpath()
+            painter.drawPath(arrow)
+
+
+class NowPlayingBar(QWidget):
+    """Persistent transport bar — a dumb view like every other custom widget
+    in this file: no DB/player access of its own, signals out for user
+    actions, setter methods in for state updates. Music only; lives outside
+    MainWindow's page-switching content_stack so playback survives tab
+    navigation."""
+
+    playPauseClicked = pyqtSignal()
+    nextClicked = pyqtSignal()
+    prevClicked = pyqtSignal()
+    shuffleToggled = pyqtSignal(bool)
+    seekRequested = pyqtSignal(int)    # ms, emitted only on slider release
+    volumeChanged = pyqtSignal(float)  # 0.0-1.0
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("nowPlayingBar")
+        self._seeking = False
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(12)
+
+        self.art_tile = ChamferedArtTile(size=40, chamfer=8, clickable=False)
+        row.addWidget(self.art_tile)
+
+        meta_col = QVBoxLayout()
+        meta_col.setSpacing(1)
+        self.title_label = QLabel("NOTHING PLAYING")
+        self.title_label.setObjectName("nowPlayingTitle")
+        self.artist_label = QLabel("")
+        self.artist_label.setObjectName("muted")
+        meta_col.addWidget(self.title_label)
+        meta_col.addWidget(self.artist_label)
+        meta_widget = QWidget()
+        meta_widget.setLayout(meta_col)
+        meta_widget.setFixedWidth(150)
+        row.addWidget(meta_widget)
+
+        # Custom-painted (TransportButton), not Unicode glyphs — media
+        # symbols (▶⏸⏮⏭⇄) render inconsistently across fonts, sometimes as
+        # an outright ugly fallback glyph. Flat vector shapes always match
+        # Direction E exactly, same reasoning as RailButton/LevelGauge.
+        self.shuffle_btn = TransportButton("shuffle", checkable=True)
+        self.shuffle_btn.setToolTip("Shuffle")
+        self.shuffle_btn.toggled.connect(self.shuffleToggled.emit)
+        row.addWidget(self.shuffle_btn)
+
+        self.prev_btn = TransportButton("prev")
+        self.prev_btn.setToolTip("Previous")
+        self.prev_btn.clicked.connect(self.prevClicked.emit)
+        row.addWidget(self.prev_btn)
+
+        self.play_pause_btn = TransportButton("play", size=(36, 26))
+        self.play_pause_btn.setToolTip("Play/Pause")
+        self.play_pause_btn.clicked.connect(self.playPauseClicked.emit)
+        row.addWidget(self.play_pause_btn)
+
+        self.next_btn = TransportButton("next")
+        self.next_btn.setToolTip("Next")
+        self.next_btn.clicked.connect(self.nextClicked.emit)
+        row.addWidget(self.next_btn)
+
+        self.position_label = QLabel("0:00")
+        self.position_label.setObjectName("muted")
+        row.addWidget(self.position_label)
+
+        self.scrub_slider = QSlider(Qt.Orientation.Horizontal)
+        self.scrub_slider.setRange(0, 0)
+        self.scrub_slider.sliderPressed.connect(self._on_scrub_pressed)
+        self.scrub_slider.sliderReleased.connect(self._on_scrub_released)
+        self.scrub_slider.valueChanged.connect(self._on_scrub_value_changed)
+        row.addWidget(self.scrub_slider, stretch=1)
+
+        self.duration_label = QLabel("0:00")
+        self.duration_label.setObjectName("muted")
+        row.addWidget(self.duration_label)
+
+        volume_label = QLabel("♪")
+        volume_label.setObjectName("muted")
+        row.addWidget(volume_label)
+
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(100)
+        self.volume_slider.setFixedWidth(80)
+        self.volume_slider.valueChanged.connect(lambda v: self.volumeChanged.emit(v / 100.0))
+        row.addWidget(self.volume_slider)
+
+        self._set_controls_enabled(False)
+
+    # ---- setters (state in) ----
+
+    def set_idle(self):
+        self.title_label.setText("NOTHING PLAYING")
+        self.artist_label.setText("")
+        self.art_tile.clear_art()
+        self.position_label.setText("0:00")
+        self.duration_label.setText("0:00")
+        self.scrub_slider.setRange(0, 0)
+        self._set_controls_enabled(False)
+
+    def set_track_info(self, title: str, artist: str, art_bytes: bytes | None):
+        self._set_controls_enabled(True)
+        self.title_label.setText(title or "Untitled")
+        self.artist_label.setText(artist or "")
+        self.art_tile.set_art(art_bytes)
+
+    def set_position(self, ms: int):
+        if self._seeking:
+            return
+        self.position_label.setText(_format_ms(ms))
+        self.scrub_slider.blockSignals(True)
+        self.scrub_slider.setValue(ms)
+        self.scrub_slider.blockSignals(False)
+
+    def set_duration(self, ms: int):
+        self.scrub_slider.setRange(0, max(0, ms))
+        self.duration_label.setText(_format_ms(ms))
+
+    def set_playing(self, playing: bool):
+        self.play_pause_btn.set_icon("pause" if playing else "play")
+
+    def set_shuffle(self, enabled: bool):
+        self.shuffle_btn.blockSignals(True)
+        self.shuffle_btn.setChecked(enabled)
+        self.shuffle_btn.blockSignals(False)
+
+    # ---- internals ----
+
+    def _set_controls_enabled(self, enabled: bool):
+        # Volume is deliberately excluded — it's an output-level control, not
+        # a "now playing" control, and works fine with nothing loaded yet.
+        for w in (self.shuffle_btn, self.prev_btn, self.play_pause_btn, self.next_btn, self.scrub_slider):
+            w.setEnabled(enabled)
+
+    def _on_scrub_pressed(self):
+        self._seeking = True
+
+    def _on_scrub_released(self):
+        self._seeking = False
+        self.seekRequested.emit(self.scrub_slider.value())
+
+    def _on_scrub_value_changed(self, value: int):
+        self.position_label.setText(_format_ms(value))

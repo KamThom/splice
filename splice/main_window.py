@@ -35,10 +35,22 @@ from PyQt6.QtWidgets import (
 
 from . import tagging
 from .library import db as libdb
+from .library.health import HealthScanWorker
+from .library.loudness import LoudnessAnalysisWorker
 from .library_view import LibraryView, PlaylistView
+from .player import TrackPlayer
 from .sidebar import PlaylistDeck, ToolRail
 from .styles import ORANGE, STYLESHEET, load_bundled_fonts
-from .widgets import CoverArtThumbnail, DropListWidget, FilePickerList, LevelGauge, PixelLabel, SplitDropZone, StatusDot
+from .widgets import (
+    ConsoleStrip,
+    CoverArtThumbnail,
+    DropListWidget,
+    FilePickerList,
+    LevelGauge,
+    NowPlayingBar,
+    PixelLabel,
+    SplitDropZone,
+)
 from .workers import (
     FFMPEG,
     FFMPEG_INSTALL_HINT,
@@ -53,17 +65,45 @@ from .workers import (
 )
 
 
-def panel(title: str) -> tuple[QFrame, QVBoxLayout]:
-    """Bordered panel frame — used only for the console, which sits outside the tabs."""
-    frame = QFrame()
-    frame.setObjectName("panel")
-    layout = QVBoxLayout(frame)
-    layout.setContentsMargins(14, 12, 14, 14)
-    layout.setSpacing(10)
-    label = QLabel(title)
-    label.setObjectName("panelTitle")
-    layout.addWidget(label)
-    return frame, layout
+class ConsoleOverlay(QFrame):
+    """Floating log panel — the console's expanded state. Deliberately not
+    added to root's QVBoxLayout (that's what lets it float over the
+    Rail+Deck+content column instead of being pushed around by it) —
+    MainWindow positions and raises it manually
+    (see _reposition_console_overlay/_toggle_console). Reuses the "panel"
+    QSS objectName for its bordered-surface look but builds its own layout
+    rather than the old panel() helper, which always added a plain "CONSOLE"
+    title label — this has its own ConsoleStrip header instead, so clicking
+    anywhere in it collapses it back down."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("panel")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(8)
+
+        self.header = ConsoleStrip()
+        self.header.set_expanded(True)
+        layout.addWidget(self.header)
+
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        font = QFont("Menlo")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.log_box.setFont(font)
+        layout.addWidget(self.log_box, stretch=1)
+
+        self.hide()
+
+    def set_status(self, state: str, text: str):
+        self.header.set_status(state, text)
+
+    def set_task_text(self, text: str):
+        self.header.set_task_text(text)
+
+    def append_log(self, text: str):
+        self.log_box.appendPlainText(text)
 
 
 def tab_content(title: str) -> tuple[QWidget, QVBoxLayout]:
@@ -108,6 +148,9 @@ class MainWindow(QMainWindow):
         self._current_download_title = None
         self._current_download_playlist_id = None
         self._current_download_kind = None
+        self.player = TrackPlayer(self)
+        self._loudness_worker = None
+        self._health_worker = None
 
         self.setWindowTitle("Splice")
         self.resize(900, 840)
@@ -127,11 +170,25 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
 
         layout.addLayout(self._build_header())
-        layout.addLayout(self._build_body(), stretch=1)
-        layout.addWidget(self._build_console())
+        layout.addWidget(self._build_body(), stretch=1)
 
-    def _build_body(self):
-        row = QHBoxLayout()
+        self.now_playing_bar = NowPlayingBar()
+        layout.addWidget(self.now_playing_bar)
+
+        self.console_strip = self._build_console()
+        layout.addWidget(self.console_strip)
+
+        # Not added to root's layout — that's what lets it float over the
+        # Rail+Deck+content column instead of being pushed around by it.
+        # MainWindow positions/raises it manually (_reposition_console_overlay).
+        self.console_overlay = ConsoleOverlay(root)
+        self.console_overlay.header.clicked.connect(self._toggle_console)
+
+        self._wire_player()
+
+    def _build_body(self) -> QWidget:
+        self.body_widget = QWidget()
+        row = QHBoxLayout(self.body_widget)
         row.setSpacing(14)
 
         self.tool_rail = ToolRail()
@@ -154,6 +211,8 @@ class MainWindow(QMainWindow):
         self.page_library = LibraryView(self._get_library_root, self._set_library_root)
         self.page_library.fixTagsRequested.connect(self._fix_tags_for_path)
         self.page_library.libraryChanged.connect(self._refresh_sidebar_playlists)
+        self.page_library.libraryChanged.connect(self._kick_off_loudness_analysis)
+        self.page_library.healthRescanRequested.connect(self._kick_off_health_analysis)
         self.page_library.playlistActivated.connect(lambda pid, name: self._on_navigate("playlist", (pid, name)))
         self.page_library.libraryLocationChanged.connect(
             lambda path: self._write_log(f"[{ts()}] Library location set to: {path}")
@@ -174,7 +233,7 @@ class MainWindow(QMainWindow):
 
         self.tool_rail.select("library")
         self._refresh_sidebar_playlists()
-        return row
+        return self.body_widget
 
     def _get_library_root(self) -> str | None:
         return self.library_root
@@ -197,10 +256,97 @@ class MainWindow(QMainWindow):
                 art_bytes = art_path.read_bytes() if art_path else None
                 playlists.append((p["id"], p["name"], art_bytes))
             self.playlist_deck.set_playlists(playlists)
-        self._refresh_youtube_playlist_combo()
+        self._refresh_playlist_combo(self.youtube_playlist_combo)
+        self._refresh_playlist_combo(self.merge_playlist_combo)
 
-    def _refresh_youtube_playlist_combo(self):
-        combo = self.youtube_playlist_combo
+    def _kick_off_loudness_analysis(self):
+        """Analyzes whatever tracks haven't been measured yet — the same
+        sweep naturally covers both "a build/download just added a few
+        tracks" and "catch up the whole existing library", since it's just
+        "measure whatever's missing" either way. Deliberately not wired to
+        _set_status: that's a single shared indicator Merge/Split/Tags
+        already treat as mutually exclusive, and YouTube downloads have
+        their own separate progress widget specifically to avoid fighting
+        over it — loudness analysis is a third independent background lane
+        that can run for a long time, so it gets its own small readout on
+        the console strip (task_label) instead of stomping on whatever
+        else's status is showing. That readout is the only way to tell it's
+        running/how far along — worth knowing it's there rather than
+        wondering why nothing looks different while it works."""
+        if not self.library_root or not Path(self.library_root).exists():
+            return
+        if self._health_worker is not None and self._health_worker.isRunning():
+            return  # defer — health's finished_ok will re-check loudness when it's done
+        if self._loudness_worker is not None and self._loudness_worker.isRunning():
+            return
+        conn = libdb.open_db(self.library_root)
+        pending = conn.execute("SELECT 1 FROM tracks WHERE loudness_lufs IS NULL LIMIT 1").fetchone()
+        conn.close()
+        if not pending:
+            self._kick_off_health_analysis()
+            return
+        self._loudness_worker = LoudnessAnalysisWorker(self.library_root)
+        self._loudness_worker.log.connect(self._write_log)
+        self._loudness_worker.progress.connect(self._on_loudness_progress)
+        self._loudness_worker.finished_ok.connect(self._on_loudness_analysis_done)
+        self._loudness_worker.start()
+
+    def _on_loudness_progress(self, current: int, total: int):
+        text = f"ANALYZING LOUDNESS ({current:,}/{total:,})"
+        self.console_strip.set_task_text(text)
+        self.console_overlay.set_task_text(text)
+
+    def _on_loudness_analysis_done(self, count: int):
+        self.console_strip.set_task_text("")
+        self.console_overlay.set_task_text("")
+        if count:
+            self._write_log(f"[{ts()}] Loudness analysis: measured {count} track(s)")
+        self._kick_off_health_analysis()
+
+    def _kick_off_health_analysis(self):
+        """Checks embedded-art presence on whatever music tracks haven't been
+        checked yet — same "measure whatever's missing" shape as loudness
+        analysis, and deliberately chained to run only after loudness
+        finishes (both directions: see the isRunning() guards below) rather
+        than as a second concurrent lane, since both are "sweep the whole
+        library once" background maintenance rather than independent
+        concerns the way YouTube downloads vs. Merge/Split/Tags are — running
+        them concurrently would mean two QThreads racing to write the one
+        shared task_label."""
+        if not self.library_root or not Path(self.library_root).exists():
+            return
+        if self._loudness_worker is not None and self._loudness_worker.isRunning():
+            return  # defer — loudness's finished_ok will re-check health when it's done
+        if self._health_worker is not None and self._health_worker.isRunning():
+            return
+        conn = libdb.open_db(self.library_root)
+        pending = conn.execute("SELECT 1 FROM tracks WHERE kind = 'music' AND has_art IS NULL LIMIT 1").fetchone()
+        conn.close()
+        if not pending:
+            return
+        self._health_worker = HealthScanWorker(self.library_root)
+        self._health_worker.log.connect(self._write_log)
+        self._health_worker.progress.connect(self._on_health_progress)
+        self._health_worker.finished_ok.connect(self._on_health_analysis_done)
+        self._health_worker.start()
+
+    def _on_health_progress(self, current: int, total: int):
+        text = f"CHECKING ART ({current:,}/{total:,})"
+        self.console_strip.set_task_text(text)
+        self.console_overlay.set_task_text(text)
+
+    def _on_health_analysis_done(self, count: int):
+        self.console_strip.set_task_text("")
+        self.console_overlay.set_task_text("")
+        if count:
+            self._write_log(f"[{ts()}] Health scan: checked art on {count} track(s)")
+        self.page_library.refresh_health_if_active()
+        self._kick_off_loudness_analysis()
+
+    def _refresh_playlist_combo(self, combo: QComboBox):
+        """Repopulates a "which playlist to add this to" combo (options:
+        no playlist / each existing playlist / create new) — shared by the
+        YouTube tab's and Merge tab's own filing-destination pickers."""
         previous = combo.currentData() if combo.count() else None
         combo.blockSignals(True)
         combo.clear()
@@ -221,8 +367,16 @@ class MainWindow(QMainWindow):
         if not is_music:
             self.youtube_playlist_combo.setCurrentIndex(0)  # "No playlist (library only)" — playlists are music-only
 
-    def _on_youtube_playlist_combo_changed(self, index: int):
-        if self.youtube_playlist_combo.itemData(index) != "__new__":
+    def _on_merge_destination_changed(self, index: int):
+        is_music = self.merge_destination_combo.itemData(index) == "music"
+        self.merge_playlist_combo.setEnabled(is_music)
+        if not is_music:
+            self.merge_playlist_combo.setCurrentIndex(0)  # "No playlist (library only)" — playlists are music-only
+
+    def _on_playlist_combo_changed(self, combo: QComboBox, index: int):
+        """Handles "+ New Playlist..." being picked in either the YouTube
+        tab's or Merge tab's playlist combo — creates it and selects it."""
+        if combo.itemData(index) != "__new__":
             return
         name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
         if ok and name.strip() and self.library_root:
@@ -230,12 +384,12 @@ class MainWindow(QMainWindow):
             playlist_id = libdb.get_or_create_playlist(conn, name.strip())
             conn.close()
             self._refresh_sidebar_playlists()
-            idx = self.youtube_playlist_combo.findData(playlist_id)
-            self.youtube_playlist_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            idx = combo.findData(playlist_id)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
         else:
             if ok and name.strip() and not self.library_root:
                 QMessageBox.information(self, "No library yet", "Set up your library first (Library page -> gear menu -> ADD SOURCES).")
-            self.youtube_playlist_combo.setCurrentIndex(0)
+            combo.setCurrentIndex(0)
 
     def _create_playlist(self):
         if not self.library_root:
@@ -387,6 +541,32 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.merge_btn)
         layout.addLayout(btn_row)
 
+        dest_row = QHBoxLayout()
+        dest_label = QLabel("File as:")
+        dest_label.setObjectName("muted")
+        dest_row.addWidget(dest_label)
+        self.merge_destination_combo = QComboBox()
+        self.merge_destination_combo.addItem("Music (library)", "music")
+        self.merge_destination_combo.addItem("Audiobook (library)", "audiobook")
+        self.merge_destination_combo.addItem("Output folder only", "output_only")
+        self.merge_destination_combo.setCurrentIndex(1)  # Audiobook — matches this
+        # panel's own "combine multi-part audiobooks" framing; Music/Output
+        # folder only are still one click away for other uses of Merge.
+        self.merge_destination_combo.currentIndexChanged.connect(self._on_merge_destination_changed)
+        dest_row.addWidget(self.merge_destination_combo)
+
+        merge_playlist_label = QLabel("Add to:")
+        merge_playlist_label.setObjectName("muted")
+        dest_row.addWidget(merge_playlist_label)
+        self.merge_playlist_combo = QComboBox()
+        self._refresh_playlist_combo(self.merge_playlist_combo)
+        self.merge_playlist_combo.setEnabled(False)  # default destination is Audiobook, not Music
+        self.merge_playlist_combo.currentIndexChanged.connect(
+            lambda idx: self._on_playlist_combo_changed(self.merge_playlist_combo, idx)
+        )
+        dest_row.addWidget(self.merge_playlist_combo)
+        layout.addLayout(dest_row)
+
         self.merge_then_split_check = QCheckBox("Then split into segments (uses the Split tab's segment length)")
         layout.addWidget(self.merge_then_split_check)
 
@@ -482,8 +662,10 @@ class MainWindow(QMainWindow):
         playlist_label.setObjectName("muted")
         add_row.addWidget(playlist_label)
         self.youtube_playlist_combo = QComboBox()
-        self._refresh_youtube_playlist_combo()
-        self.youtube_playlist_combo.currentIndexChanged.connect(self._on_youtube_playlist_combo_changed)
+        self._refresh_playlist_combo(self.youtube_playlist_combo)
+        self.youtube_playlist_combo.currentIndexChanged.connect(
+            lambda idx: self._on_playlist_combo_changed(self.youtube_playlist_combo, idx)
+        )
         add_row.addWidget(self.youtube_playlist_combo)
         layout.addLayout(add_row)
 
@@ -661,43 +843,71 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return widget
 
-    def _build_console(self):
-        frame, layout = panel("CONSOLE")
-        status_row = QHBoxLayout()
-        self.status_dot = StatusDot()
-        self.status_label = QLabel("STANDBY")
-        self.status_label.setObjectName("muted")
-        self.console_toggle_btn = QPushButton("SHOW ▾")
-        self.console_toggle_btn.setFixedWidth(90)
-        self.console_toggle_btn.clicked.connect(self._toggle_console)
-        status_row.addWidget(self.status_dot)
-        status_row.addWidget(self.status_label)
-        status_row.addStretch(1)
-        status_row.addWidget(self.console_toggle_btn)
-        layout.addLayout(status_row)
-
-        self.log_box = QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        font = QFont("Menlo")
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        self.log_box.setFont(font)
-        self.log_box.setVisible(False)  # collapsed by default — declutters the always-on panel
-        layout.addWidget(self.log_box)
-        return frame
+    def _build_console(self) -> ConsoleStrip:
+        strip = ConsoleStrip()
+        strip.clicked.connect(self._toggle_console)
+        return strip
 
     # ---- shared behavior ----
 
     def _toggle_console(self):
-        visible = not self.log_box.isVisible()
-        self.log_box.setVisible(visible)
-        self.console_toggle_btn.setText("HIDE ▴" if visible else "SHOW ▾")
+        expanding = not self.console_overlay.isVisible()
+        if expanding:
+            self._reposition_console_overlay()
+            self.console_overlay.show()
+            self.console_overlay.raise_()
+        else:
+            self.console_overlay.hide()
+        self.console_strip.set_expanded(expanding)
+
+    def _reposition_console_overlay(self):
+        body_rect = self.body_widget.geometry()
+        rail_width = self.tool_rail.width()
+        x = body_rect.left() + rail_width
+        width = max(0, body_rect.width() - rail_width)
+        height = max(60, min(280, body_rect.height()))
+        y = body_rect.bottom() - height
+        self.console_overlay.setGeometry(x, y, width, height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "console_overlay") and self.console_overlay.isVisible():
+            self._reposition_console_overlay()
 
     def _write_log(self, text: str):
-        self.log_box.appendPlainText(text)
+        self.console_overlay.append_log(text)
 
     def _set_status(self, state: str, text: str):
-        self.status_dot.set_state(state)
-        self.status_label.setText(text)
+        self.console_strip.set_status(state, text)
+        self.console_overlay.set_status(state, text)
+
+    # ---- playback ----
+
+    def _wire_player(self):
+        self.page_library.playRequested.connect(self._play_from_queue)
+        self.page_playlist.playRequested.connect(self._play_from_queue)
+
+        self.now_playing_bar.playPauseClicked.connect(self.player.toggle_play_pause)
+        self.now_playing_bar.nextClicked.connect(self.player.next)
+        self.now_playing_bar.prevClicked.connect(self.player.prev)
+        self.now_playing_bar.shuffleToggled.connect(self.player.set_shuffle)
+        self.now_playing_bar.seekRequested.connect(self.player.seek)
+        self.now_playing_bar.volumeChanged.connect(self.player.set_volume)
+
+        self.player.positionChanged.connect(self.now_playing_bar.set_position)
+        self.player.durationChanged.connect(self.now_playing_bar.set_duration)
+        self.player.playbackStateChanged.connect(lambda s: self.now_playing_bar.set_playing(s == "playing"))
+        self.player.shuffleChanged.connect(self.now_playing_bar.set_shuffle)
+        self.player.nowPlayingChanged.connect(self._on_now_playing_changed)
+        self.player.playbackError.connect(lambda msg: self._write_log(f"[{ts()}] Playback error: {msg}"))
+
+    def _play_from_queue(self, tracks: list, index: int):
+        self.player.play_queue(tracks, index)
+
+    def _on_now_playing_changed(self, track: dict):
+        self.now_playing_bar.set_track_info(track["title"], track["artist"], track.get("art"))
+        self.page_library.set_now_playing_track(track["id"])
+        self.page_playlist.set_now_playing_track(track["id"])
 
     def _choose_output_dir(self):
         start_dir = self.output_dir or str(Path.home())
@@ -721,6 +931,13 @@ class MainWindow(QMainWindow):
         self._check_ffmpeg()
         # No eager output-folder prompt here — Merge/Split/YouTube each prompt
         # lazily, only when actually needed, via _prompt_for_output_dir below.
+        # Explicit call required, not just the libraryChanged connection below
+        # — LibraryView.__init__ already emits libraryChanged once during
+        # _build_body(), before anything's connected to it, so relying on the
+        # connection alone would mean the one-time catch-up pass over an
+        # existing library never starts on a fresh launch (same reason
+        # _refresh_sidebar_playlists() needs its own explicit call too).
+        self._kick_off_loudness_analysis()
 
     def _prompt_for_output_dir(self) -> str | None:
         """Cancel-friendly: returns None if the user backs out instead of forcing
@@ -807,6 +1024,10 @@ class MainWindow(QMainWindow):
         self._set_status("done", "MERGE COMPLETE")
         self._set_busy(False)
         self.merge_list.clear()
+
+        kind = self.merge_destination_combo.currentData()
+        playlist_id = self.merge_playlist_combo.currentData() if kind == "music" else None
+        self._file_into_library(out_path, playlist_id, kind)
 
         if self.merge_then_split_check.isChecked():
             self.tool_rail.select("split")
@@ -1023,15 +1244,15 @@ class MainWindow(QMainWindow):
     def _on_youtube_ok(self, out_path: str):
         self.youtube_progress.set_done("COMPLETE")
         self.youtube_active_worker = None
-        self._file_youtube_download(out_path, self._current_download_playlist_id, self._current_download_kind or "music")
+        self._file_into_library(out_path, self._current_download_playlist_id, self._current_download_kind or "music")
         self._pump_youtube_queue()
 
-    def _file_youtube_download(self, out_path: str, playlist_id, kind: str = "music"):
-        """Files a completed download according to the destination chosen when
-        it was queued: into the library as music (optionally into a playlist)
-        or as an audiobook, or left as-is in the output folder with no
-        library filing at all. Music/audiobook filing is skipped quietly if
-        no library is set up yet; output-folder-only needs no library."""
+    def _file_into_library(self, out_path: str, playlist_id, kind: str = "music"):
+        """Files a completed file (a YouTube download, or a Merge output)
+        according to the chosen destination: into the library as music
+        (optionally into a playlist) or as an audiobook, or left as-is with
+        no library filing at all. Music/audiobook filing is skipped quietly
+        if no library is set up yet; output-folder-only needs no library."""
         if kind == "output_only":
             self._write_log(f"[{ts()}] Left in output folder: {Path(out_path).name}")
             return
@@ -1046,6 +1267,12 @@ class MainWindow(QMainWindow):
             return
         if status == "added":
             self._write_log(f"[{ts()}] Filed into library ({kind}): {Path(out_path).name}")
+        # libraryChanged (and therefore _kick_off_loudness_analysis) only
+        # fires from page_library.refresh() — which this method only calls
+        # conditionally, below, if Library happens to be the visible page —
+        # so a download filed while the user's on another tab still needs
+        # its own explicit trigger.
+        self._kick_off_loudness_analysis()
 
         if kind == "music" and playlist_id is not None:
             conn = libdb.open_db(self.library_root)

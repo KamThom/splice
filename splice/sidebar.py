@@ -169,7 +169,11 @@ class PlaylistDeck(QWidget):
         header_row.addWidget(header)
         header_row.addStretch(1)
         add_btn = QPushButton("+")
-        add_btn.setFixedSize(20, 20)
+        # No setFixedSize — the app's QPushButton QSS has 7px/16px padding
+        # (32px+ of horizontal space alone), so a fixed 20x20 box leaves no
+        # room for the glyph and it renders as a blank square. Same bug,
+        # same fix, as the sort-direction/transport buttons earlier this
+        # session — let Qt size it from its own sizeHint().
         add_btn.setToolTip("New playlist")
         add_btn.clicked.connect(self.createRequested.emit)
         header_row.addWidget(add_btn)

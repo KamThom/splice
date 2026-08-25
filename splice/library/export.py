@@ -12,6 +12,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from ..widgets import natural_sort_key
 from ..workers import sanitize_filename, unique_path
 from . import db as libdb
+from . import loudness
 
 
 @dataclass
@@ -64,26 +65,31 @@ class CopyTracksWorker(QThread):
     def run(self):
         total = len(self.library_paths)
         self.log.emit(f"Copying {total} track(s)...")
-        for i, rel_path in enumerate(self.library_paths, start=1):
-            if self._cancel_requested:
-                self.cancelled.emit()
-                return
-            self.progress.emit(int(i / total * 100) if total else 100)
+        conn = libdb.open_db(self.library_root)
+        try:
+            for i, rel_path in enumerate(self.library_paths, start=1):
+                if self._cancel_requested:
+                    self.cancelled.emit()
+                    return
+                self.progress.emit(int(i / total * 100) if total else 100)
 
-            src = Path(self.library_root) / rel_path
-            if not src.exists():
-                self.report.failed_count += 1
-                self.report.failed_files.append((rel_path, "missing from library"))
-                self.log.emit(f"  Missing: {rel_path}")
-                continue
-            try:
-                dest = unique_path(Path(self.destination) / src.name)
-                shutil.copy2(src, dest)
-                self.report.copied_count += 1
-            except Exception as e:
-                self.report.failed_count += 1
-                self.report.failed_files.append((src.name, str(e)))
-                self.log.emit(f"  FAILED {src.name}: {e}")
+                src = Path(self.library_root) / rel_path
+                if not src.exists():
+                    self.report.failed_count += 1
+                    self.report.failed_files.append((rel_path, "missing from library"))
+                    self.log.emit(f"  Missing: {rel_path}")
+                    continue
+                try:
+                    dest = unique_path(Path(self.destination) / src.name)
+                    gain_db = loudness.gain_for_track(conn, rel_path)
+                    loudness.apply_gain_and_copy(src, dest, gain_db)
+                    self.report.copied_count += 1
+                except Exception as e:
+                    self.report.failed_count += 1
+                    self.report.failed_files.append((src.name, str(e)))
+                    self.log.emit(f"  FAILED {src.name}: {e}")
+        finally:
+            conn.close()
 
         self.log.emit(f"Copy complete: {self.report.copied_count} copied, {self.report.failed_count} failed.")
         self.finished_ok.emit(self.report)
@@ -134,7 +140,7 @@ class ExportWorker(QThread):
                 if item.kind == "playlist":
                     self._export_playlist(conn, item)
                 else:
-                    self._export_audiobook(item)
+                    self._export_audiobook(conn, item)
                 if self._cancel_requested:
                     self.cancelled.emit()
                     return
@@ -186,14 +192,15 @@ class ExportWorker(QThread):
             title = Path(rel_path).stem
             dest_name = f"{i:0{width}d} - {sanitize_filename(title)}{src.suffix}"
             try:
-                shutil.copy2(src, dest_folder / dest_name)
+                gain_db = loudness.gain_for_track(conn, rel_path)
+                loudness.apply_gain_and_copy(src, dest_folder / dest_name, gain_db)
                 self.report.copied_count += 1
             except Exception as e:
                 self.report.failed_count += 1
                 self.report.failed_files.append((dest_name, str(e)))
                 self.log.emit(f"  FAILED {dest_name}: {e}")
 
-    def _export_audiobook(self, item: ExportItem):
+    def _export_audiobook(self, conn, item: ExportItem):
         src = Path(self.library_root) / "Audiobooks" / item.key
         dest_folder = self._dest_folder_for(item.name)
         self._prepare_dest_folder(dest_folder)
@@ -220,7 +227,9 @@ class ExportWorker(QThread):
             try:
                 dest_path = dest_folder / path.relative_to(rel_base)
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, dest_path)
+                rel_path = path.relative_to(Path(self.library_root)).as_posix()
+                gain_db = loudness.gain_for_track(conn, rel_path)
+                loudness.apply_gain_and_copy(path, dest_path, gain_db)
                 self.report.copied_count += 1
             except Exception as e:
                 self.report.failed_count += 1
