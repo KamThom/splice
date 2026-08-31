@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -21,11 +21,13 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QStyle,
@@ -527,6 +529,52 @@ def render_chamfered_pixmap(
     return pixmap
 
 
+def render_mosaic_bytes(cover_art_list: list[bytes]) -> bytes | None:
+    """Composites up to 4 covers into one square PNG — a playlist's
+    auto-fallback artwork when no explicit artwork has been set, the same
+    idea Spotify/Apple Music use for auto-generated playlist covers.
+    Returns raw PNG bytes so it slots into the exact same `image_bytes`
+    parameter every artwork call site already passes to
+    render_chamfered_pixmap — nothing about the rendering pipeline itself
+    needs to know a mosaic was involved. A single distinct cover is
+    returned as-is (a "mosaic" of one image is pointless); with 2 or 3,
+    covers repeat to fill all four quadrants rather than leaving dead
+    corners, matching how the major players handle a short playlist too."""
+    if not cover_art_list:
+        return None
+    if len(cover_art_list) == 1:
+        return cover_art_list[0]
+
+    size = 240
+    half = size // 2
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(CONSOLE))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    quadrants = [QRectF(0, 0, half, half), QRectF(half, 0, half, half),
+                 QRectF(0, half, half, half), QRectF(half, half, half, half)]
+    for i, rect in enumerate(quadrants):
+        cover = QPixmap()
+        if not cover.loadFromData(cover_art_list[i % len(cover_art_list)]):
+            continue
+        scaled = cover.scaled(
+            int(rect.width()), int(rect.height()),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation,
+        )
+        x = rect.left() + (rect.width() - scaled.width()) / 2
+        y = rect.top() + (rect.height() - scaled.height()) / 2
+        painter.setClipRect(rect)
+        painter.drawPixmap(int(x), int(y), scaled)
+        painter.setClipping(False)
+    painter.end()
+
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    pixmap.save(buffer, "PNG")
+    return bytes(buffer.data())
+
+
 class ChamferedArtTile(QLabel):
     """A render_chamfered_pixmap(), kept in a QLabel so it can sit in a
     layout like any other widget. clickable=True (the PlaylistView header
@@ -582,6 +630,166 @@ class ChamferedArtTile(QLabel):
         super().mousePressEvent(event)
 
 
+class TileInfoButton(QAbstractButton):
+    """Small circular info affordance overlaid on a standalone-book tile's
+    art (series tiles don't get one — they navigate into the series, not
+    open Track Info for a single track). Draws the same vector dot+stem-free
+    plus glyph TrackRowDelegate paints for its per-row info icon, so both
+    routes to Track Info read as the same affordance — this one's a real
+    child QWidget rather than a painted hit-zone since a shelf tile has no
+    delegate to paint through."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(22, 22)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(ORANGE) if self.underMouse() else QColor(28, 30, 34, 190))
+        painter.drawEllipse(rect)
+        cx, cy = rect.center().x(), rect.center().y()
+        pen = QPen(QColor("white"), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        half = 4.0
+        painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+        painter.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
+
+
+class BookShelfTile(QWidget):
+    """One tile in the audiobook shelf grid — cover art + title + subtitle,
+    the whole widget clickable (not just the art). Used for both series
+    tiles (art = the series' own artwork, subtitle = book count) and
+    standalone-book tiles (art = that book's own embedded art, subtitle =
+    author). Reuses ChamferedArtTile/render_chamfered_pixmap unmodified —
+    square, not the mockup's portrait 3:4 covers, a deliberate scope cut to
+    avoid widening a renderer three other things already depend on."""
+
+    clicked = pyqtSignal()
+    infoClicked = pyqtSignal()
+
+    def __init__(self, art_bytes: bytes | None, title: str, subtitle: str, size: int = 120, show_info: bool = False):
+        super().__init__()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.art = ChamferedArtTile(size=size, chamfer=16, clickable=False)
+        self.art.set_art(art_bytes)
+        layout.addWidget(self.art)
+
+        if show_info:
+            # A real child widget positioned over the art tile's corner —
+            # Qt dispatches the click to this button, not up to the tile's
+            # own mousePressEvent, so it can't also trigger playback.
+            info_btn = TileInfoButton(self.art)
+            info_btn.move(size - info_btn.width() - 6, 6)
+            info_btn.raise_()
+            info_btn.clicked.connect(lambda checked=False: self.infoClicked.emit())
+
+        title_label = QLabel(title)
+        title_label.setWordWrap(True)
+        title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title_label)
+
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("muted")
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(subtitle_label)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            return
+        super().mousePressEvent(event)
+
+
+class AudiobookShelfWidget(QWidget):
+    """Top-level Audiobooks browse view — a scrollable grid of
+    BookShelfTiles, one per series plus one per standalone (non-series)
+    audiobook. Owns no DB/file access itself (same dumb-view convention as
+    every other widget in this file) — populate() is handed already-fetched
+    rows and already-resolved art bytes; the caller (LibraryView) does the
+    actual DB queries and tagging.read_tags()/find_series_artwork() calls,
+    same division of labor PlaylistView already uses for its own art tile."""
+
+    seriesActivated = pyqtSignal(str)  # series (Album tag) name
+    playRequested = pyqtSignal(list, int)  # standalone tile clicked — same contract LibraryView.playRequested uses
+    infoRequested = pyqtSignal(int)  # standalone tile's info icon clicked — track_id
+
+    COLUMNS = 4
+
+    def __init__(self):
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(self._scroll)
+
+        self._grid_host = QWidget()
+        self._grid = QGridLayout(self._grid_host)
+        self._grid.setSpacing(18)
+        self._scroll.setWidget(self._grid_host)
+
+    def populate(self, series_entries: list[tuple[str, str, "bytes | None"]], standalone_entries: list[dict]):
+        """series_entries: (name, subtitle, art_bytes) tuples — mirrors
+        PlaylistDeck.set_playlists's (id, name, art_bytes) shape.
+        standalone_entries: dicts already shaped like a play_queue() entry
+        (id/title/artist/path/kind/loudness_lufs/loudness_true_peak) plus an
+        extra 'art' key for the tile's own thumbnail, so a click can go
+        straight to playRequested with no further lookup needed."""
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget:
+                # setParent(None) detaches it from the widget tree
+                # immediately (synchronously) — deleteLater() alone only
+                # schedules the eventual C++-level destruction, which can
+                # leave a stale tile briefly still paintable if populate()
+                # runs again before the event loop gets a chance to process
+                # that deferred deletion (e.g. two refreshes back to back
+                # with no intervening idle tick).
+                widget.setParent(None)
+                widget.deleteLater()
+
+        row = col = 0
+
+        def place(tile: BookShelfTile):
+            nonlocal row, col
+            self._grid.addWidget(tile, row, col)
+            col += 1
+            if col >= self.COLUMNS:
+                col = 0
+                row += 1
+
+        for name, subtitle, art_bytes in series_entries:
+            tile = BookShelfTile(art_bytes, name, subtitle)
+            tile.clicked.connect(lambda checked=False, n=name: self.seriesActivated.emit(n))
+            place(tile)
+
+        for entry in standalone_entries:
+            tile = BookShelfTile(
+                entry.get("art"), entry["title"], entry.get("artist") or "Standalone", show_info=True
+            )
+            tile.clicked.connect(lambda checked=False, e=entry: self._play_standalone(e))
+            tile.infoClicked.connect(lambda tid=entry["id"]: self.infoRequested.emit(tid))
+            place(tile)
+
+        self._grid.setRowStretch(row + 1, 1)  # keep tiles pinned to the top when they don't fill the scroll area
+
+    def _play_standalone(self, entry: dict):
+        queue_dict = {k: v for k, v in entry.items() if k != "art"}
+        self.playRequested.emit([queue_dict], 0)
+
+
 def _resized_font(base_font: QFont, delta: int, minimum: int = 8) -> QFont:
     """Copy of base_font resized by delta, robust to whether its size was
     set in points or pixels. The app stylesheet sets font-size in px, which
@@ -611,6 +819,20 @@ class TrackRowDelegate(QStyledItemDelegate):
     ROW_HEIGHT = 46
     PADDING_X = 14
     INFO_ICON_SIZE = 20
+    THUMB_SIZE = 34
+
+    @staticmethod
+    def thumbnail_rect(row_rect: QRect) -> QRect:
+        """Rect of the optional left-side thumbnail — only actually drawn
+        when the item has a DecorationRole icon set (Songs/Playlist rows
+        never set one, so their layout is unaffected; the audiobook series
+        book list does). Shared by paint() and click hit-testing, same
+        rationale as badge_rect/info_icon_rect."""
+        size = TrackRowDelegate.THUMB_SIZE
+        return QRect(
+            row_rect.left() + TrackRowDelegate.PADDING_X,
+            row_rect.center().y() - size // 2, size, size,
+        )
 
     @staticmethod
     def _badge_width(base_font: QFont, badge: str | None) -> int:
@@ -711,7 +933,12 @@ class TrackRowDelegate(QStyledItemDelegate):
         painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
         painter.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
 
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
         text_left = rect.left() + self.PADDING_X
+        if icon is not None and not icon.isNull():
+            thumb_rect = self.thumbnail_rect(rect)
+            icon.paint(painter, thumb_rect)
+            text_left = thumb_rect.right() + 10
         text_right = info_rect.left() - 8
         title_rect = QRect(text_left, rect.top() + 6, max(0, text_right - text_left), 20)
         artist_rect = QRect(text_left, rect.top() + 24, max(0, text_right - text_left), 18)
@@ -746,6 +973,7 @@ class TrackListWidget(QListWidget):
 
     badgeClicked = pyqtSignal(int, QPoint)
     infoClicked = pyqtSignal(int)
+    thumbnailClicked = pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
@@ -779,12 +1007,24 @@ class TrackListWidget(QListWidget):
         rect = TrackRowDelegate.info_icon_rect(self.visualItemRect(item), self.font(), data.get("badge"))
         return rect.contains(pos)
 
+    def _thumb_hit(self, pos) -> bool:
+        item = self.itemAt(pos)
+        if item is None or item.icon().isNull():
+            return False
+        rect = TrackRowDelegate.thumbnail_rect(self.visualItemRect(item))
+        return rect.contains(pos)
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             item = self.itemAt(event.pos())
             if item is not None:
                 data = item.data(Qt.ItemDataRole.UserRole) or {}
                 if data.get("id") is not None:
+                    if not item.icon().isNull():
+                        thumb_rect = TrackRowDelegate.thumbnail_rect(self.visualItemRect(item))
+                        if thumb_rect.contains(event.pos()):
+                            self.thumbnailClicked.emit(data["id"])
+                            return
                     info_rect = TrackRowDelegate.info_icon_rect(
                         self.visualItemRect(item), self.font(), data.get("badge")
                     )
@@ -800,11 +1040,14 @@ class TrackListWidget(QListWidget):
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        # Without this, double-clicking exactly on the badge pill or the info
-        # icon would both trigger their single-click handler above and fire
-        # itemDoubleClicked (play) at the same instant, since Qt delivers
-        # both a press and a double-click event for one gesture.
-        if event.button() == Qt.MouseButton.LeftButton and (self._badge_hit(event.pos()) or self._info_hit(event.pos())):
+        # Without this, double-clicking exactly on the badge pill, the info
+        # icon, or the thumbnail would both trigger their single-click
+        # handler above and fire itemDoubleClicked (play) at the same
+        # instant, since Qt delivers both a press and a double-click event
+        # for one gesture.
+        if event.button() == Qt.MouseButton.LeftButton and (
+            self._badge_hit(event.pos()) or self._info_hit(event.pos()) or self._thumb_hit(event.pos())
+        ):
             return
         super().mouseDoubleClickEvent(event)
 
@@ -1003,9 +1246,9 @@ class TransportButton(QAbstractButton):
 class NowPlayingBar(QWidget):
     """Persistent transport bar — a dumb view like every other custom widget
     in this file: no DB/player access of its own, signals out for user
-    actions, setter methods in for state updates. Music only; lives outside
-    MainWindow's page-switching content_stack so playback survives tab
-    navigation."""
+    actions, setter methods in for state updates. Plays both music and
+    audiobooks; lives outside MainWindow's page-switching content_stack so
+    playback survives tab navigation."""
 
     playPauseClicked = pyqtSignal()
     nextClicked = pyqtSignal()
@@ -1127,6 +1370,14 @@ class NowPlayingBar(QWidget):
         self.shuffle_btn.blockSignals(True)
         self.shuffle_btn.setChecked(enabled)
         self.shuffle_btn.blockSignals(False)
+
+    def set_shuffle_enabled(self, enabled: bool):
+        """Disables the shuffle button while an audiobook queue is playing
+        — book/chapter order shouldn't get scrambled. TrackPlayer already
+        guarantees an audiobook queue is never actually shuffled regardless
+        of this button's state; this is the visible half of that, not the
+        correctness guarantee."""
+        self.shuffle_btn.setEnabled(enabled)
 
     # ---- internals ----
 

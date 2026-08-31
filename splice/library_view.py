@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QStackedWidget,
     QTabWidget,
     QTreeView,
     QVBoxLayout,
@@ -44,8 +45,23 @@ from .library.export import (
 )
 from .library.migrate import AddFilesWorker, LibraryBuildWorker, LibraryScanWorker, MusicSource, adopt_orphan_file
 from .library.playlists import clear_playlist_artwork, find_playlist_artwork, set_playlist_artwork, write_m3u8
+from .library.series_artwork import (
+    clear_series_artwork,
+    find_series_artwork,
+    set_series_artwork,
+)
 from .styles import GREEN, MUTED, ORANGE, RED, STAT_AMBER, STAT_BLUE, STAT_PURPLE
-from .widgets import ChamferedArtTile, ChamferedFrame, LevelGauge, PixelLabel, TrackListWidget, TrackRowDelegate
+from .widgets import (
+    AudiobookShelfWidget,
+    ChamferedArtTile,
+    ChamferedFrame,
+    LevelGauge,
+    PixelLabel,
+    TrackListWidget,
+    TrackRowDelegate,
+    render_chamfered_pixmap,
+    render_mosaic_bytes,
+)
 from .workers import sanitize_filename
 
 
@@ -67,6 +83,48 @@ def choose_multiple_directories(parent, caption: str, start_dir: str) -> list[st
 
 def _is_unsorted(library_path: str) -> bool:
     return "_Unsorted" in Path(library_path).parts
+
+
+def _try_unlink(path: Path) -> str | None:
+    """Attempts to delete a library file, returning None on success
+    (including "already gone" — missing_ok=True) or a short reason string
+    on failure. A file can be transiently locked by another process on
+    Windows (a search indexer or antivirus scan mid-sweep, a leftover
+    mutagen/media handle) — that must never be allowed to escape as an
+    uncaught PermissionError and crash the whole app the way it did before
+    this existed; callers skip that one file and keep going instead."""
+    try:
+        path.unlink(missing_ok=True)
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def _collect_cover_art(library_root: str, ordered_paths: list[str], limit: int = 4) -> list[bytes]:
+    """Reads embedded art off the first `limit` tracks (in playlist order)
+    that actually have any, for building a playlist's auto-mosaic fallback.
+    Stops as soon as `limit` covers are found — a playlist can have hundreds
+    of tracks and this only ever needs a handful for a 2x2 mosaic."""
+    covers = []
+    for rel_path in ordered_paths:
+        if len(covers) >= limit:
+            break
+        try:
+            art = tagging.read_tags(str(Path(library_root) / rel_path)).get("art")
+        except Exception:
+            art = None
+        if art:
+            covers.append(art)
+    return covers
+
+
+def playlist_mosaic_art(library_root: str, ordered_paths: list[str]) -> bytes | None:
+    """Auto-generated fallback artwork for a playlist with no explicit
+    artwork set yet — a mosaic of its first few tracks' own covers. Callers
+    should cache the result keyed on (playlist_id, ordered_paths[:4]) —
+    this itself does no caching, since it has no notion of "this playlist"
+    across calls, only "these paths right now"."""
+    return render_mosaic_bytes(_collect_cover_art(library_root, ordered_paths))
 
 
 def make_track_list() -> TrackListWidget:
@@ -139,11 +197,15 @@ HEALTH_TAB_INDEX = 4
 
 
 def _find_missing_tags(tracks):
-    """Filed (non-Unsorted) music tracks missing date or tracknumber —
-    title/artist/album can't be blank on a filed track (naming.music_destination
-    routes any blank one to _Unsorted instead), so this is the one metadata
-    gap a properly-filed track can still have."""
-    return [t for t in tracks if not (t["date"] or "").strip() or not (t["tracknumber"] or "").strip()]
+    """Filed (non-Unsorted) music tracks missing title, artist, or album.
+    None of these can be blank at filing time (naming.music_destination
+    routes any blank one to _Unsorted instead) — but an in-place tag edit
+    on an already-filed track can still clear one without moving the file
+    back to _Unsorted, which is the gap this actually catches."""
+    return [
+        t for t in tracks
+        if not (t["title"] or "").strip() or not (t["artist"] or "").strip() or not (t["album"] or "").strip()
+    ]
 
 
 def _find_missing_files(library_root: str, tracks) -> list:
@@ -805,6 +867,30 @@ def _format_duration(seconds) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
+def _parse_book_number(tracknumber) -> int | None:
+    """Parses a Track # tag value ("2", "2/6", "", None) into a book's
+    position within its series, the same way naming.music_destination
+    already parses tracknumber for its own filename-prefix purposes.
+    Returns None when unparseable so the caller can fall back to title
+    sort instead of a SQL text-sort (which would put "10" before "2")."""
+    if not tracknumber:
+        return None
+    try:
+        return int(str(tracknumber).split("/")[0].strip())
+    except ValueError:
+        return None
+
+
+def sort_series_books(tracks: list) -> list:
+    """Sorts audiobook rows within a series by parsed book number, falling
+    back to title for anything unparseable (pushed to the end, in title
+    order, rather than interleaved by parse-failure)."""
+    def key(t):
+        n = _parse_book_number(t["tracknumber"])
+        return (0, n) if n is not None else (1, (t["title"] or "").lower())
+    return sorted(tracks, key=key)
+
+
 def _format_filesize(path: Path) -> str:
     try:
         size_mb = path.stat().st_size / (1024 * 1024)
@@ -1061,6 +1147,7 @@ class LibraryView(QWidget):
     playlistActivated = pyqtSignal(int, str)  # playlist_id, name — picked from a track's badge-click menu
     playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path), start index — double-clicked a song
     healthRescanRequested = pyqtSignal()  # HEALTH tab's RESCAN button — nudges MainWindow's background art-check worker
+    audiobookSeriesActivated = pyqtSignal(str)  # series (Album tag) name — a shelf series tile was clicked
 
     def __init__(self, get_library_root, set_library_root):
         super().__init__()
@@ -1068,6 +1155,7 @@ class LibraryView(QWidget):
         self._set_library_root = set_library_root
         self._sort_field = "Title"
         self._sort_ascending = True
+        self._standalone_audiobook_art_cache: dict[int, "bytes | None"] = {}
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(200)
@@ -1150,9 +1238,10 @@ class LibraryView(QWidget):
         self.songs_list.itemDoubleClicked.connect(self._play_from_songs)  # music only — never audiobooks_list
         self.duplicates_list = QListWidget()
         self.unsorted_list = QListWidget()
+        self.unsorted_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
         self.sub_tabs.addTab(self.songs_list, "SONGS")
-        self.sub_tabs.addTab(self.audiobooks_list, "AUDIOBOOKS")
+        self.sub_tabs.addTab(self._build_audiobooks_tab(), "AUDIOBOOKS")
         self.sub_tabs.addTab(self.duplicates_list, "DUPLICATES")
         self.sub_tabs.addTab(self.unsorted_list, "UNSORTED")
         self.sub_tabs.addTab(self._build_health_tab(), "HEALTH")
@@ -1195,6 +1284,9 @@ class LibraryView(QWidget):
         fix_tags_btn = QPushButton("FIX TAGS")
         fix_tags_btn.clicked.connect(self._fix_selected_unsorted_tags)
         unsorted_row.addWidget(fix_tags_btn)
+        remove_unsorted_btn = QPushButton("REMOVE SELECTED")
+        remove_unsorted_btn.clicked.connect(self._remove_selected_unsorted)
+        unsorted_row.addWidget(remove_unsorted_btn)
         layout.addWidget(self.unsorted_actions)
 
         self.sub_tabs.currentChanged.connect(self._update_sub_tab_actions)
@@ -1220,9 +1312,50 @@ class LibraryView(QWidget):
         inner.addWidget(value_label)
         return frame
 
+    def _build_audiobooks_tab(self) -> QWidget:
+        """SERIES (default) / ALL toggle over a stack: the new shelf-of-
+        covers browse view, and the existing flat sortable list (unchanged)
+        with its full bulk-action row — additive, not a replacement, so
+        Copy Selected/Remove Selected/Edit Tags stay available on the full
+        set via ALL even though the shelf itself has no bulk actions of its
+        own at the top level (drilling into a series gets its own)."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(8)
+
+        toggle_row = QHBoxLayout()
+        view_label = QLabel("VIEW:")
+        view_label.setObjectName("muted")
+        toggle_row.addWidget(view_label)
+        self.audiobooks_view_toggle = QComboBox()
+        self.audiobooks_view_toggle.addItems(["SERIES", "ALL"])
+        self.audiobooks_view_toggle.currentTextChanged.connect(self._on_audiobooks_view_changed)
+        toggle_row.addWidget(self.audiobooks_view_toggle)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
+
+        self.audiobooks_stack = QStackedWidget()
+        self.audiobooks_shelf = AudiobookShelfWidget()
+        self.audiobooks_shelf.seriesActivated.connect(self.audiobookSeriesActivated.emit)
+        self.audiobooks_shelf.playRequested.connect(self.playRequested.emit)
+        self.audiobooks_shelf.infoRequested.connect(self._show_track_info_by_id)
+        self.audiobooks_stack.addWidget(self.audiobooks_shelf)
+        self.audiobooks_stack.addWidget(self.audiobooks_list)
+        layout.addWidget(self.audiobooks_stack, stretch=1)
+
+        return tab
+
+    def _on_audiobooks_view_changed(self, text: str):
+        self.audiobooks_stack.setCurrentWidget(
+            self.audiobooks_list if text == "ALL" else self.audiobooks_shelf
+        )
+        self._update_sub_tab_actions(self.sub_tabs.currentIndex())
+
     def _update_sub_tab_actions(self, index: int):
-        self.sort_actions.setVisible(index in (0, 1))  # SONGS, AUDIOBOOKS
-        self.copy_actions.setVisible(index in (0, 1))  # SONGS, AUDIOBOOKS
+        audiobooks_all = index == 1 and self.audiobooks_view_toggle.currentText() == "ALL"
+        self.sort_actions.setVisible(index == 0 or audiobooks_all)
+        self.copy_actions.setVisible(index == 0 or audiobooks_all)
         self.add_to_playlist_btn.setVisible(index == 0)  # SONGS only — playlists are a music-only concept
         self.dupe_actions.setVisible(index == 2)  # DUPLICATES
         self.unsorted_actions.setVisible(index == 3)  # UNSORTED
@@ -1326,6 +1459,7 @@ class LibraryView(QWidget):
         populate_track_list(self.audiobooks_list, sorted_audiobooks, membership)
         self._populate_unsorted(unsorted_tracks)
         self._populate_dupes(conn, dupes)
+        self._refresh_audiobook_shelf(conn, library_root)
 
         self.sub_tabs.setTabText(3, f"UNSORTED ({len(unsorted_tracks)})")
         self.empty_hint.setText(
@@ -1361,6 +1495,41 @@ class LibraryView(QWidget):
             })
             self.unsorted_list.addItem(item)
 
+    def _refresh_audiobook_shelf(self, conn, library_root: str):
+        """Populates the SERIES-view shelf. Series artwork reads are cheap
+        (one small file per distinct series, typically very few) so they're
+        read fresh every call; standalone books' embedded art is cached by
+        track id across refreshes instead of re-read on every keystroke of
+        search (the exact anti-pattern the Health dashboard's own refresh
+        deliberately avoids for the same reason)."""
+        series_entries = []
+        for row in libdb.list_audiobook_series(conn):
+            art_path = find_series_artwork(library_root, row["album"])
+            art_bytes = art_path.read_bytes() if art_path else None
+            book_word = "book" if row["book_count"] == 1 else "books"
+            series_entries.append((row["album"], f"{row['book_count']} {book_word}", art_bytes))
+
+        standalone_entries = []
+        for t in libdb.list_standalone_audiobooks(conn):
+            if t["id"] not in self._standalone_audiobook_art_cache:
+                full_path = str(Path(library_root) / t["library_path"])
+                try:
+                    self._standalone_audiobook_art_cache[t["id"]] = tagging.read_tags(full_path).get("art")
+                except Exception:
+                    self._standalone_audiobook_art_cache[t["id"]] = None
+            standalone_entries.append({
+                "id": t["id"],
+                "title": t["title"] or Path(t["library_path"]).stem,
+                "artist": t["artist"] or "",
+                "path": str(Path(library_root) / t["library_path"]),
+                "kind": "audiobook",
+                "loudness_lufs": t["loudness_lufs"],
+                "loudness_true_peak": t["loudness_true_peak"],
+                "art": self._standalone_audiobook_art_cache[t["id"]],
+            })
+
+        self.audiobooks_shelf.populate(series_entries, standalone_entries)
+
     def _populate_dupes(self, conn, dupes):
         self.duplicates_list.clear()
         for d in dupes:
@@ -1376,6 +1545,7 @@ class LibraryView(QWidget):
     def _clear_all(self):
         self.songs_list.clear()
         self.audiobooks_list.clear()
+        self.audiobooks_shelf.populate([], [])
         self.duplicates_list.clear()
         self.unsorted_list.clear()
         self.sub_tabs.setTabText(3, "UNSORTED (0)")
@@ -1475,13 +1645,15 @@ class LibraryView(QWidget):
                 "title": data["title"],
                 "artist": data["artist"],
                 "path": str(Path(library_root) / data["library_path"]),
+                "kind": "music",
                 "loudness_lufs": data.get("loudness_lufs"),
                 "loudness_true_peak": data.get("loudness_true_peak"),
             })
         self.playRequested.emit(tracks, self.songs_list.row(item))
 
     def set_now_playing_track(self, track_id: int | None):
-        self.songs_list.set_playing_track(track_id)  # music only — audiobooks_list never plays
+        self.songs_list.set_playing_track(track_id)
+        self.audiobooks_list.set_playing_track(track_id)  # picks up an audiobook played from the shelf/series view
 
     def _remove_selected_tracks(self):
         active_list = self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
@@ -1503,11 +1675,16 @@ class LibraryView(QWidget):
             return
         conn = libdb.open_db(library_root)
         affected_playlist_ids = set()
+        failed = []
         for item in items:
             data = item.data(Qt.ItemDataRole.UserRole)
             track_id = data["id"]
+            path = Path(library_root) / data["library_path"]
+            error = _try_unlink(path)
+            if error:
+                failed.append(path.name)
+                continue  # leave its index entry in place — the file's still really there
             affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
-            (Path(library_root) / data["library_path"]).unlink(missing_ok=True)
             libdb.delete_track(conn, track_id)
         for playlist_id in affected_playlist_ids:
             row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
@@ -1516,6 +1693,13 @@ class LibraryView(QWidget):
                 write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
         conn.close()
         self.refresh()
+        if failed:
+            QMessageBox.warning(
+                self, "Some files couldn't be removed",
+                "These are currently in use by another program, so they weren't removed "
+                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
+                + "\n".join(failed),
+            )
 
     def _dismiss_selected_dupe(self):
         item = self.duplicates_list.currentItem()
@@ -1557,13 +1741,21 @@ class LibraryView(QWidget):
     def _resolve_dupe(self, keep_id: int, remove_id: int):
         library_root = self._get_library_root()
         conn = libdb.open_db(library_root)
+        row = conn.execute("SELECT library_path FROM tracks WHERE id = ?", (remove_id,)).fetchone()
+        if row:
+            error = _try_unlink(Path(library_root) / row["library_path"])
+            if error:
+                conn.close()
+                QMessageBox.warning(
+                    self, "Couldn't resolve",
+                    "That file is currently in use by another program and can't be removed yet — "
+                    "close whatever has it open and try again. Nothing was changed.",
+                )
+                return
         affected_playlist_ids = libdb.playlists_containing_track(conn, remove_id)
         for playlist_id in affected_playlist_ids:
             position = libdb.next_playlist_position(conn, playlist_id)
             libdb.add_playlist_track(conn, playlist_id, keep_id, position)  # no-op if keep_id is already in there
-        row = conn.execute("SELECT library_path FROM tracks WHERE id = ?", (remove_id,)).fetchone()
-        if row:
-            (Path(library_root) / row["library_path"]).unlink(missing_ok=True)
         libdb.delete_track(conn, remove_id)  # also drops the fuzzy_dupes row for this pair
         for playlist_id in affected_playlist_ids:
             prow = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
@@ -1574,12 +1766,57 @@ class LibraryView(QWidget):
         self.refresh()
 
     def _fix_selected_unsorted_tags(self):
-        item = self.unsorted_list.currentItem()
-        if item is None:
-            QMessageBox.information(self, "Nothing selected", "Click a file in the list first.")
+        items = self.unsorted_list.selectedItems()
+        if len(items) != 1:
+            QMessageBox.information(self, "Select one file", "Select exactly one file to fix its tags.")
             return
-        data = item.data(Qt.ItemDataRole.UserRole)
+        data = items[0].data(Qt.ItemDataRole.UserRole)
         self.fixTagsRequested.emit(data["path"], data["track_id"])
+
+    def _remove_selected_unsorted(self):
+        items = self.unsorted_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more files first.")
+            return
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        reply = QMessageBox.question(
+            self, "Remove from library",
+            f"Permanently delete {len(items)} file(s) from your library? This only removes "
+            f"Splice's own copy — nothing at your original source location is touched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        conn = libdb.open_db(library_root)
+        affected_playlist_ids = set()
+        failed = []
+        for item in items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            track_id = data["track_id"]
+            path = Path(data["path"])
+            error = _try_unlink(path)
+            if error:
+                failed.append(path.name)
+                continue  # leave its index entry in place — the file's still really there
+            affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
+            libdb.delete_track(conn, track_id)
+        for playlist_id in affected_playlist_ids:
+            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+            if row:
+                paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+                write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
+        conn.close()
+        self.refresh()
+        if failed:
+            QMessageBox.warning(
+                self, "Some files couldn't be removed",
+                "These are currently in use by another program, so they weren't removed "
+                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
+                + "\n".join(failed),
+            )
 
     # ---- health dashboard ----
 
@@ -1968,6 +2205,8 @@ class PlaylistView(QWidget):
         self._get_library_root = get_library_root
         self._playlist_id = None
         self._playlist_name = None
+        self._mosaic_signature = None  # (playlist_id, first-4-track-paths) — see _load_artwork
+        self._mosaic_cache = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 14)
@@ -2096,7 +2335,22 @@ class PlaylistView(QWidget):
             self.art_tile.clear_art()
             return
         art_path = find_playlist_artwork(library_root, self._playlist_id)
-        self.art_tile.set_art(art_path.read_bytes() if art_path else None)
+        if art_path:
+            self.art_tile.set_art(art_path.read_bytes())
+            return
+        # No explicit artwork set — fall back to an auto-generated mosaic of
+        # the playlist's own first few tracks' covers. Cached on a signature
+        # of (playlist, first-4-track-paths) so reorders/adds elsewhere in
+        # the playlist that don't touch the first 4 slots don't force a
+        # re-read of every cover file on every refresh() call.
+        conn = libdb.open_db(library_root)
+        ordered_paths = libdb.playlist_track_paths_in_order(conn, self._playlist_id)
+        conn.close()
+        signature = (self._playlist_id, tuple(ordered_paths[:4]))
+        if signature != self._mosaic_signature:
+            self._mosaic_signature = signature
+            self._mosaic_cache = playlist_mosaic_art(library_root, ordered_paths)
+        self.art_tile.set_art(self._mosaic_cache)
 
     def _write_current_m3u8(self, library_root: str):
         conn = libdb.open_db(library_root)
@@ -2180,6 +2434,7 @@ class PlaylistView(QWidget):
                 "title": data["title"],
                 "artist": data["artist"],
                 "path": str(Path(library_root) / data["library_path"]),
+                "kind": "music",  # playlists are a music-only concept
                 "loudness_lufs": data.get("loudness_lufs"),
                 "loudness_true_peak": data.get("loudness_true_peak"),
             })
@@ -2278,3 +2533,268 @@ class PlaylistView(QWidget):
         if not library_root:
             return
         ExportDialog(self, library_root, preselected_playlist_id=self._playlist_id).exec()
+
+
+class AudiobookSeriesView(QWidget):
+    """One audiobook series, drilled into from the Audiobooks shelf — hero
+    art (the series' own, separate from any individual book's cover) + a
+    list of its books in Track # order. Structurally close to PlaylistView
+    but simpler: no drag-reorder (book order is fixed by tag, not
+    user-arranged), and REMOVE SELECTED really deletes from the library —
+    audiobooks are never in a playlist, so there's no membership-only
+    "remove" concept the way PlaylistView's REMOVE SELECTED has."""
+
+    backRequested = pyqtSignal()
+    playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path/kind), start index
+    fixTagsRequested = pyqtSignal(str, int)  # mp3 path, track_id — same contract as the other views'
+
+    def __init__(self, get_library_root):
+        super().__init__()
+        self._get_library_root = get_library_root
+        self._series_name = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
+
+        back_btn = QPushButton("‹ AUDIOBOOKS")
+        back_btn.clicked.connect(self.backRequested.emit)
+        layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        hero_row = QHBoxLayout()
+        hero_row.setSpacing(16)
+        self.art_tile = ChamferedArtTile(size=96, chamfer=16, clickable=True)
+        self.art_tile.clicked.connect(self._choose_artwork)
+        hero_row.addWidget(self.art_tile)
+
+        meta_col = QVBoxLayout()
+        meta_col.setSpacing(3)
+        meta_col.addWidget(PixelLabel("AUDIOBOOK SERIES", point_size=9, color=MUTED, letter_spacing=2))
+        self.title_label = PixelLabel("", point_size=16, letter_spacing=1)
+        meta_col.addWidget(self.title_label)
+        self.subtitle_label = QLabel("")
+        self.subtitle_label.setObjectName("muted")
+        meta_col.addWidget(self.subtitle_label)
+        meta_col.addStretch(1)
+        hero_row.addLayout(meta_col, stretch=1)
+
+        settings_btn = QPushButton("⚙")
+        settings_btn.setToolTip("Series actions")
+        settings_menu = QMenu(self)
+        remove_artwork_action = QAction("REMOVE ARTWORK", self)
+        remove_artwork_action.triggered.connect(self._remove_artwork)
+        settings_menu.addAction(remove_artwork_action)
+        settings_btn.setMenu(settings_menu)
+        hero_row.addWidget(settings_btn)
+        layout.addLayout(hero_row)
+
+        hint = QLabel("Click a book's cover to play it and queue the rest of the series after it.")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        self.track_list = TrackListWidget()
+        self.track_list.setItemDelegate(TrackRowDelegate(self.track_list))
+        self.track_list.setMouseTracking(True)
+        self.track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.track_list.infoClicked.connect(self._show_track_info_by_id)
+        self.track_list.thumbnailClicked.connect(self._play_book)
+        layout.addWidget(self.track_list, stretch=1)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        edit_tags_btn = QPushButton("EDIT TAGS")
+        edit_tags_btn.clicked.connect(self._edit_tags_selected)
+        action_row.addWidget(edit_tags_btn)
+        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn.clicked.connect(self._remove_selected)
+        action_row.addWidget(remove_btn)
+        copy_btn = QPushButton("COPY SELECTED...")
+        copy_btn.clicked.connect(self._copy_selected)
+        action_row.addWidget(copy_btn)
+        layout.addLayout(action_row)
+
+    def show_series(self, series_name: str):
+        self._series_name = series_name
+        self.title_label.setText(series_name.upper())
+        self.refresh()
+
+    def _library_root_or_none(self) -> str | None:
+        library_root = self._get_library_root()
+        if not library_root or not Path(library_root).exists():
+            return None
+        return library_root
+
+    def refresh(self):
+        if self._series_name is None:
+            return
+        library_root = self._library_root_or_none()
+        self.track_list.clear()
+        if not library_root:
+            self._load_artwork()
+            return
+        conn = libdb.open_db(library_root)
+        books = sort_series_books(libdb.list_tracks_in_series(conn, self._series_name))
+        conn.close()
+
+        total_seconds = 0.0
+        for book in books:
+            full_path = str(Path(library_root) / book["library_path"])
+            try:
+                art_bytes = tagging.read_tags(full_path).get("art")
+            except Exception:
+                art_bytes = None
+            book_num = _parse_book_number(book["tracknumber"])
+            title = book["title"] or Path(book["library_path"]).stem
+            display_title = f"{book_num}. {title}" if book_num is not None else title
+            subtitle = f"{book['artist'] or 'Unknown Author'} · {_format_duration(book['duration_seconds'])}"
+            item = QListWidgetItem()
+            item.setIcon(QIcon(render_chamfered_pixmap(art_bytes, 40, 8)))
+            item.setData(Qt.ItemDataRole.UserRole, {
+                "id": book["id"],
+                "library_path": book["library_path"],
+                "title": display_title,
+                "artist": subtitle,
+                "badge": None,
+                "loudness_lufs": book["loudness_lufs"],
+                "loudness_true_peak": book["loudness_true_peak"],
+            })
+            self.track_list.addItem(item)
+            total_seconds += book["duration_seconds"] or 0.0
+
+        book_word = "book" if len(books) == 1 else "books"
+        self.subtitle_label.setText(f"{len(books)} {book_word} · {_format_total_playtime(total_seconds)} total")
+        self._load_artwork()
+
+    def _load_artwork(self):
+        library_root = self._library_root_or_none()
+        if not library_root or self._series_name is None:
+            self.art_tile.clear_art()
+            return
+        art_path = find_series_artwork(library_root, self._series_name)
+        self.art_tile.set_art(art_path.read_bytes() if art_path else None)
+
+    def _choose_artwork(self):
+        if self._series_name is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose series artwork", str(Path.home()), "Images (*.jpg *.jpeg *.png *.webp *.bmp)"
+        )
+        if not path:
+            return
+        set_series_artwork(library_root, self._series_name, path)
+        self._load_artwork()
+
+    def _remove_artwork(self):
+        if self._series_name is None:
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        clear_series_artwork(library_root, self._series_name)
+        self._load_artwork()
+
+    def _show_track_info_by_id(self, track_id: int):
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        row = conn.execute("SELECT kind, library_path FROM tracks WHERE id = ?", (track_id,)).fetchone()
+        conn.close()
+        if not row:
+            return
+        dialog = TrackInfoDialog(self, library_root, track_id, row["kind"])
+        dialog.exec()
+        if dialog.edit_tags_requested:
+            self.fixTagsRequested.emit(str(Path(library_root) / row["library_path"]), track_id)
+
+    def _play_book(self, track_id: int):
+        """Builds the queue from the full series (in order) so playback
+        auto-advances into the next book — the caller clicked one specific
+        book's cover, but the point of series ordering is continuing
+        through it, not playing one book in isolation."""
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        start = None
+        tracks = []
+        for i in range(self.track_list.count()):
+            data = self.track_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if data["id"] == track_id:
+                start = i
+            tracks.append({
+                "id": data["id"],
+                "title": data["title"],
+                "artist": data["artist"],
+                "path": str(Path(library_root) / data["library_path"]),
+                "kind": "audiobook",
+                "loudness_lufs": data.get("loudness_lufs"),
+                "loudness_true_peak": data.get("loudness_true_peak"),
+            })
+        if start is not None:
+            self.playRequested.emit(tracks, start)
+
+    def set_now_playing_track(self, track_id: int | None):
+        self.track_list.set_playing_track(track_id)
+
+    def _edit_tags_selected(self):
+        items = self.track_list.selectedItems()
+        if len(items) != 1:
+            QMessageBox.information(self, "Select one book", "Select exactly one book to edit its tags.")
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        data = items[0].data(Qt.ItemDataRole.UserRole)
+        full_path = str(Path(library_root) / data["library_path"])
+        self.fixTagsRequested.emit(full_path, data["id"])
+
+    def _remove_selected(self):
+        items = self.track_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more books first.")
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        reply = QMessageBox.question(
+            self, "Remove from library",
+            f"Permanently delete {len(items)} book(s) from your library? This only removes "
+            f"Splice's own copy — nothing at your original source location is touched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        conn = libdb.open_db(library_root)
+        failed = []
+        for item in items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            path = Path(library_root) / data["library_path"]
+            error = _try_unlink(path)
+            if error:
+                failed.append(path.name)
+                continue  # leave its index entry in place — the file's still really there
+            libdb.delete_track(conn, data["id"])  # audiobooks are never in playlists — no m3u8 cleanup needed
+        conn.close()
+        self.refresh()
+        if failed:
+            QMessageBox.warning(
+                self, "Some books couldn't be removed",
+                "These are currently in use by another program, so they weren't removed "
+                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
+                + "\n".join(failed),
+            )
+
+    def _copy_selected(self):
+        items = self.track_list.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nothing selected", "Select one or more books first.")
+            return
+        library_root = self._library_root_or_none()
+        if not library_root:
+            return
+        paths = [item.data(Qt.ItemDataRole.UserRole)["library_path"] for item in items]
+        CopyTracksDialog(self, library_root, paths).exec()

@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -91,6 +92,20 @@ def _stream_ffmpeg_progress(process: subprocess.Popen, total_seconds: float | No
             continue
         pct = max(0, min(100, int(elapsed / total_seconds * 100)))
         progress_signal.emit(pct)
+
+
+def _drain_stderr(process: subprocess.Popen, sink: list):
+    """Reads stderr on its own thread while _stream_ffmpeg_progress reads
+    stdout on the caller's thread. Both pipes have a limited OS buffer — if
+    ffmpeg writes enough to stderr (e.g. a burst of "non-monotonic DTS"
+    warnings while concatenating mp3s) and nothing drains it, ffmpeg blocks
+    on the write and the app blocks on stdout waiting for a process that's
+    stuck, deadlocking with no error and no further progress. Draining both
+    concurrently is the fix — subprocess.run()'s own capture_output already
+    does this internally, only these hand-rolled Popen calls need it."""
+    if process.stderr:
+        for line in process.stderr:
+            sink.append(line)
 
 
 class MergeWorker(QThread):
@@ -197,9 +212,13 @@ class MergeWorker(QThread):
             self.log.emit(f"[{ts()}]   FAILED: ffmpeg not found.")
             self.finished_err.emit("ffmpeg not found")
             return None, ""
+        stderr_lines: list = []
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(self._process, stderr_lines), daemon=True)
+        stderr_thread.start()
         _stream_ffmpeg_progress(self._process, total_seconds, self.progress)
         self._process.wait()
-        stderr = self._process.stderr.read() if self._process.stderr else ""
+        stderr_thread.join(timeout=5)
+        stderr = "".join(stderr_lines)
         returncode = self._process.returncode
         self._process = None
         return returncode, stderr
@@ -281,9 +300,13 @@ class SplitWorker(QThread):
             self.log.emit(f"[{ts()}]   FAILED: ffmpeg not found.")
             return []
 
+        stderr_lines: list = []
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(self._process, stderr_lines), daemon=True)
+        stderr_thread.start()
         _stream_ffmpeg_progress(self._process, total_seconds, self.progress)
         self._process.wait()
-        stderr = self._process.stderr.read() if self._process.stderr else ""
+        stderr_thread.join(timeout=5)
+        stderr = "".join(stderr_lines)
         returncode = self._process.returncode
         self._process = None
 

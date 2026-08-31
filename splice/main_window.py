@@ -37,7 +37,7 @@ from . import tagging
 from .library import db as libdb
 from .library.health import HealthScanWorker
 from .library.loudness import LoudnessAnalysisWorker
-from .library_view import LibraryView, PlaylistView
+from .library_view import AudiobookSeriesView, LibraryView, PlaylistView
 from .player import TrackPlayer
 from .sidebar import PlaylistDeck, ToolRail
 from .styles import ORANGE, STYLESHEET, load_bundled_fonts
@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self.player = TrackPlayer(self)
         self._loudness_worker = None
         self._health_worker = None
+        self._playlist_mosaic_cache = {}  # playlist_id -> (first-4-track-paths signature, mosaic bytes|None)
 
         self.setWindowTitle("Splice")
         self.resize(900, 840)
@@ -214,18 +215,24 @@ class MainWindow(QMainWindow):
         self.page_library.libraryChanged.connect(self._kick_off_loudness_analysis)
         self.page_library.healthRescanRequested.connect(self._kick_off_health_analysis)
         self.page_library.playlistActivated.connect(lambda pid, name: self._on_navigate("playlist", (pid, name)))
+        self.page_library.audiobookSeriesActivated.connect(
+            lambda name: self._on_navigate("audiobook_series", name)
+        )
         self.page_library.libraryLocationChanged.connect(
             lambda path: self._write_log(f"[{ts()}] Library location set to: {path}")
         )
         self.page_playlist = PlaylistView(self._get_library_root)
         self.page_playlist.playlistsChanged.connect(self._refresh_sidebar_playlists)
         self.page_playlist.fixTagsRequested.connect(self._fix_tags_for_path)
+        self.page_audiobook_series = AudiobookSeriesView(self._get_library_root)
+        self.page_audiobook_series.fixTagsRequested.connect(self._fix_tags_for_path)
+        self.page_audiobook_series.backRequested.connect(self._return_to_audiobooks)
         self.page_merge = self._build_merge_panel()
         self.page_split = self._build_split_panel()
         self.page_youtube = self._build_youtube_panel()
         self.page_tags = self._build_metadata_panel()
-        pages = (self.page_library, self.page_playlist, self.page_merge,
-                 self.page_split, self.page_youtube, self.page_tags)
+        pages = (self.page_library, self.page_playlist, self.page_audiobook_series,
+                 self.page_merge, self.page_split, self.page_youtube, self.page_tags)
         for page in pages:
             self.content_stack.addWidget(page)
         content_layout.addWidget(self.content_stack)
@@ -247,14 +254,30 @@ class MainWindow(QMainWindow):
             self.playlist_deck.set_playlists([])
         else:
             from .library.playlists import find_playlist_artwork
+            from .library_view import playlist_mosaic_art
             conn = libdb.open_db(self.library_root)
             rows = libdb.list_playlists(conn)
-            conn.close()
             playlists = []
             for p in rows:
                 art_path = find_playlist_artwork(self.library_root, p["id"])
-                art_bytes = art_path.read_bytes() if art_path else None
+                if art_path:
+                    art_bytes = art_path.read_bytes()
+                else:
+                    # No explicit artwork — fall back to an auto-mosaic of
+                    # the playlist's own first few tracks' covers, cached
+                    # per playlist so this doesn't re-read cover files on
+                    # every refresh (this fires on every library search
+                    # keystroke via libraryChanged, not just playlist edits).
+                    ordered_paths = libdb.playlist_track_paths_in_order(conn, p["id"])
+                    signature = tuple(ordered_paths[:4])
+                    cached = self._playlist_mosaic_cache.get(p["id"])
+                    if cached is not None and cached[0] == signature:
+                        art_bytes = cached[1]
+                    else:
+                        art_bytes = playlist_mosaic_art(self.library_root, ordered_paths)
+                        self._playlist_mosaic_cache[p["id"]] = (signature, art_bytes)
                 playlists.append((p["id"], p["name"], art_bytes))
+            conn.close()
             self.playlist_deck.set_playlists(playlists)
         self._refresh_playlist_combo(self.youtube_playlist_combo)
         self._refresh_playlist_combo(self.merge_playlist_combo)
@@ -280,7 +303,9 @@ class MainWindow(QMainWindow):
         if self._loudness_worker is not None and self._loudness_worker.isRunning():
             return
         conn = libdb.open_db(self.library_root)
-        pending = conn.execute("SELECT 1 FROM tracks WHERE loudness_lufs IS NULL LIMIT 1").fetchone()
+        pending = conn.execute(
+            "SELECT 1 FROM tracks WHERE kind = 'music' AND loudness_lufs IS NULL LIMIT 1"
+        ).fetchone()
         conn.close()
         if not pending:
             self._kick_off_health_analysis()
@@ -452,6 +477,12 @@ class MainWindow(QMainWindow):
             self.content_stack.setCurrentWidget(self.page_playlist)
             return
 
+        if kind == "audiobook_series":
+            self.tool_rail.deselect_all()
+            self.page_audiobook_series.show_series(payload)  # payload = series (Album tag) name
+            self.content_stack.setCurrentWidget(self.page_audiobook_series)
+            return
+
         self.playlist_deck.clear_selection()
         pages = {
             "library": self.page_library,
@@ -463,6 +494,15 @@ class MainWindow(QMainWindow):
         page = pages.get(kind)
         if page is not None:
             self.content_stack.setCurrentWidget(page)
+
+    def _return_to_audiobooks(self):
+        """The audiobook series view's back button — returns to Library on
+        the Audiobooks tab, with the SERIES sub-view active (where you'd
+        have come from to get here in the first place)."""
+        self.tool_rail.select("library")
+        self.page_library.sub_tabs.setCurrentIndex(1)  # AUDIOBOOKS
+        self.page_library.audiobooks_view_toggle.setCurrentText("SERIES")
+        self.content_stack.setCurrentWidget(self.page_library)
 
     def _build_header(self):
         outer = QVBoxLayout()
@@ -886,6 +926,7 @@ class MainWindow(QMainWindow):
     def _wire_player(self):
         self.page_library.playRequested.connect(self._play_from_queue)
         self.page_playlist.playRequested.connect(self._play_from_queue)
+        self.page_audiobook_series.playRequested.connect(self._play_from_queue)
 
         self.now_playing_bar.playPauseClicked.connect(self.player.toggle_play_pause)
         self.now_playing_bar.nextClicked.connect(self.player.next)
@@ -908,6 +949,12 @@ class MainWindow(QMainWindow):
         self.now_playing_bar.set_track_info(track["title"], track["artist"], track.get("art"))
         self.page_library.set_now_playing_track(track["id"])
         self.page_playlist.set_now_playing_track(track["id"])
+        self.page_audiobook_series.set_now_playing_track(track["id"])
+        # Book/chapter order shouldn't get scrambled — TrackPlayer already
+        # guarantees an audiobook queue is never actually shuffled
+        # regardless of this button's state; disabling it too is the
+        # visible half of that, not the correctness guarantee.
+        self.now_playing_bar.set_shuffle_enabled(track.get("kind") != "audiobook")
 
     def _choose_output_dir(self):
         start_dir = self.output_dir or str(Path.home())

@@ -1,7 +1,9 @@
-"""In-app music playback — a thin QObject wrapper around QMediaPlayer/
+"""In-app playback — a thin QObject wrapper around QMediaPlayer/
 QAudioOutput that owns queue/shuffle state and never leaks either Qt
-multimedia object to callers. Music only: audiobooks are consumed on the
-Shokz/iPod via Export, not played in-app."""
+multimedia object to callers. Plays both music and audiobooks; each queue
+dict carries a "kind" key ("music"/"audiobook") that drives per-kind
+loudness targets and disables shuffle for audiobook queues (chapter/book
+order shouldn't get scrambled), regardless of the shuffle toggle's state."""
 
 import random
 
@@ -50,10 +52,12 @@ class TrackPlayer(QObject):
     # ---- transport ----
 
     def play_queue(self, tracks: list[dict], start_index: int):
-        """tracks: dicts with at least id/title/artist/path (absolute path).
-        Builds the queue from whatever order the caller displayed it in.
-        Respects shuffle if it's already on, rather than resetting it —
-        shuffle is a mode, not a one-shot."""
+        """tracks: dicts with at least id/title/artist/path (absolute path)/
+        kind ("music" or "audiobook" — drives loudness target and whether
+        shuffle can apply). Builds the queue from whatever order the caller
+        displayed it in. Respects shuffle if it's already on, rather than
+        resetting it — shuffle is a mode, not a one-shot (except audiobook
+        queues, which are never shuffled regardless)."""
         if not tracks or not (0 <= start_index < len(tracks)):
             return
         self._queue = list(tracks)
@@ -91,6 +95,15 @@ class TrackPlayer(QObject):
         if enabled == self._shuffle:
             return
         self._shuffle = enabled
+        if self._queue and self._queue[0].get("kind") == "audiobook":
+            # Still record the toggle (it applies to the *next* queue
+            # loaded) but never reorder a currently-playing audiobook queue
+            # — book/chapter order isn't something to scramble. The button
+            # is also disabled in the UI while an audiobook plays
+            # (NowPlayingBar.set_shuffle_enabled), so this mainly guards
+            # against a stale toggle from a previous music queue.
+            self.shuffleChanged.emit(enabled)
+            return
         if self._queue:
             # Re-anchor at whatever's actually playing right now and rebuild
             # the *future* from there — deliberately not "keep the old
@@ -113,7 +126,11 @@ class TrackPlayer(QObject):
     # ---- internals ----
 
     def _initial_order(self, start_index: int) -> list[int]:
-        if not self._shuffle:
+        # Audiobook queues are never shuffled, regardless of the global
+        # toggle's state — it may still be True from a previous music
+        # queue.
+        shuffle_eligible = self._shuffle and (not self._queue or self._queue[0].get("kind") != "audiobook")
+        if not shuffle_eligible:
             return list(range(len(self._queue)))
         remaining = [i for i in range(len(self._queue)) if i != start_index]
         random.shuffle(remaining)
@@ -122,12 +139,9 @@ class TrackPlayer(QObject):
     def _load_and_play(self, track: dict):
         self._had_error_for_current_load = False
         self._media_player.setSource(QUrl.fromLocalFile(track["path"]))
-        # Every track that reaches the player today is music (Songs and
-        # Playlists are the only two double-click-to-play entry points, and
-        # both are music-only) — hardcoded rather than plumbed through the
-        # queue dict for a value that's never actually different yet.
+        kind = track.get("kind", "music")
         lufs, true_peak = track.get("loudness_lufs"), track.get("loudness_true_peak")
-        self._track_gain_db = compute_gain_db(lufs, true_peak, "music") if lufs is not None and true_peak is not None else 0.0
+        self._track_gain_db = compute_gain_db(lufs, true_peak, kind) if lufs is not None and true_peak is not None else 0.0
         self._apply_volume()
         self._media_player.play()
         art = tagging.read_tags(track["path"]).get("art")

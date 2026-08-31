@@ -90,12 +90,13 @@ def apply_gain_and_copy(src: Path, dest: Path, gain_db: float):
 
 
 class LoudnessAnalysisWorker(QThread):
-    """Analyzes every track not yet measured (libdb.tracks_missing_loudness)
-    — the same sweep serves both "catch up the existing library" and "just
-    the handful of tracks a build/download just added", since it's simply
-    "measure whatever's missing" either way. One bad file logs and moves on
-    rather than aborting the whole batch, same convention every other
-    library worker in this app already follows."""
+    """Analyzes every music track not yet measured (libdb.tracks_missing_loudness
+    — scoped to kind='music' only, audiobooks are excluded from this sweep
+    entirely) — the same sweep serves both "catch up the existing library"
+    and "just the handful of tracks a build/download just added", since
+    it's simply "measure whatever's missing" either way. One bad file logs
+    and moves on rather than aborting the whole batch, same convention
+    every other library worker in this app already follows."""
 
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)  # (tracks processed so far, total pending)

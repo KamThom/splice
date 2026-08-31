@@ -164,6 +164,33 @@ def list_tracks(conn: sqlite3.Connection, kind: str | None = None) -> list[sqlit
     return conn.execute("SELECT * FROM tracks ORDER BY artist, album, tracknumber").fetchall()
 
 
+def list_audiobook_series(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """One row per distinct non-blank Album tag among audiobooks — the
+    Album tag doubles as the series name (no separate series table)."""
+    return conn.execute(
+        """SELECT album, COUNT(*) AS book_count, SUM(duration_seconds) AS total_seconds
+           FROM tracks WHERE kind = 'audiobook' AND album IS NOT NULL AND trim(album) != ''
+           GROUP BY album ORDER BY album"""
+    ).fetchall()
+
+
+def list_standalone_audiobooks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Audiobooks with no Album tag set — not part of any series."""
+    return conn.execute(
+        """SELECT * FROM tracks WHERE kind = 'audiobook'
+           AND (album IS NULL OR trim(album) = '') ORDER BY title"""
+    ).fetchall()
+
+
+def list_tracks_in_series(conn: sqlite3.Connection, series_name: str) -> list[sqlite3.Row]:
+    """Unordered by book position — Track # is free-form text ("2", "2/6",
+    blank), so the caller sorts by parsed book number instead of relying on
+    a SQL text-sort that would put "10" before "2"."""
+    return conn.execute(
+        "SELECT * FROM tracks WHERE kind = 'audiobook' AND album = ?", (series_name,)
+    ).fetchall()
+
+
 def list_playlists(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM playlists ORDER BY name").fetchall()
 
@@ -273,7 +300,9 @@ def set_track_loudness(conn: sqlite3.Connection, track_id: int, lufs: float, tru
 
 
 def tracks_missing_loudness(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute("SELECT id, library_path, kind FROM tracks WHERE loudness_lufs IS NULL").fetchall()
+    return conn.execute(
+        "SELECT id, library_path, kind FROM tracks WHERE kind = 'music' AND loudness_lufs IS NULL"
+    ).fetchall()
 
 
 def set_track_art_flag(conn: sqlite3.Connection, track_id: int, has_art: bool):
