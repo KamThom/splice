@@ -974,6 +974,22 @@ class MainWindow(QMainWindow):
         if not shutil.which(FFMPEG):
             QMessageBox.critical(self, "ffmpeg not found", FFMPEG_INSTALL_HINT)
 
+    def closeEvent(self, event):
+        """Cancels every worker still running when the window closes. Just
+        setting a cancel flag isn't enough on its own — a worker's own
+        ffmpeg subprocess (loudness analysis on a large file, an export
+        mid-encode) can still be in flight, and Windows does NOT kill child
+        processes when their parent exits: an unmanaged one just keeps
+        running as an orphan, still holding whatever file it has open,
+        indefinitely. Each worker's cancel() now also kills its own live
+        subprocess (see LoudnessAnalysisWorker/CopyTracksWorker/ExportWorker),
+        so calling cancel() here is what actually prevents that instead of
+        just stopping the QThread loop between files."""
+        for worker in (self._loudness_worker, self._health_worker, self.active_worker, self.youtube_active_worker):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+        super().closeEvent(event)
+
     def _startup(self):
         self._check_ffmpeg()
         # No eager output-folder prompt here — Merge/Split/YouTube each prompt

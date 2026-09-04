@@ -60,7 +60,14 @@ def refile_track(library_root: str, track_id: int) -> bool:
     Unsorted tab's "Fix Tags" action so a track actually leaves _Unsorted once
     it's properly tagged, rather than just having its ID3 frames rewritten in
     place. Always refreshes the stored hash too, since editing tags changes
-    the file's bytes. Returns True if the file was physically moved."""
+    the file's bytes. Also resets has_art back to NULL — the Health
+    dashboard's art-presence flag is otherwise a write-once cache
+    (HealthScanWorker only ever checks rows where it's still NULL), so
+    without this, adding cover art through the Tags editor to a track
+    already flagged "missing art" would leave it stuck showing as missing
+    forever; resetting it here lets the next Health sweep re-verify for
+    real instead of trusting stale state. Returns True if the file was
+    physically moved."""
     conn = libdb.open_db(library_root)
     try:
         row = conn.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
@@ -96,7 +103,7 @@ def refile_track(library_root: str, track_id: int) -> bool:
         new_library_path = dest_abs.relative_to(library_root).as_posix()
         conn.execute(
             """UPDATE tracks SET hash = ?, library_path = ?, title = ?, artist = ?,
-                                  album = ?, date = ?, tracknumber = ? WHERE id = ?""",
+                                  album = ?, date = ?, tracknumber = ?, has_art = NULL WHERE id = ?""",
             (scanned.hash, new_library_path, scanned.title, scanned.artist, scanned.album,
              scanned.date, scanned.tracknumber, track_id),
         )
