@@ -6,8 +6,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, QUrl
-from PyQt6.QtGui import QAction, QDesktopServices, QFont
+from PyQt6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -15,7 +15,9 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -39,16 +41,16 @@ from .library.health import HealthScanWorker
 from .library.loudness import LoudnessAnalysisWorker
 from .library_view import AudiobookSeriesView, LibraryView, PlaylistView
 from .player import TrackPlayer
-from .sidebar import PlaylistDeck, ToolRail
-from .styles import ORANGE, STYLESHEET, load_bundled_fonts
+from .sidebar import Sidebar
+from .styles import STYLESHEET, build_palette, load_bundled_fonts
 from .widgets import (
     ConsoleStrip,
     CoverArtThumbnail,
     DropListWidget,
     FilePickerList,
     LevelGauge,
+    LogButton,
     NowPlayingBar,
-    PixelLabel,
     SplitDropZone,
 )
 from .workers import (
@@ -72,7 +74,7 @@ class ConsoleOverlay(QFrame):
     MainWindow positions and raises it manually
     (see _reposition_console_overlay/_toggle_console). Reuses the "panel"
     QSS objectName for its bordered-surface look but builds its own layout
-    rather than the old panel() helper, which always added a plain "CONSOLE"
+    rather than the old panel() helper, which always added a plain "Console"
     title label — this has its own ConsoleStrip header instead, so clicking
     anywhere in it collapses it back down."""
 
@@ -106,24 +108,106 @@ class ConsoleOverlay(QFrame):
         self.log_box.appendPlainText(text)
 
 
+class ToolDrawer(QFrame):
+    """Merge / Split / YouTube / Tags slide in here, over the right side of
+    the content area, instead of replacing the page you were on — so the
+    library stays visible (and you can drag songs from it into Merge or
+    Tags). Not in any layout: MainWindow positions it (reposition()) and
+    shows/hides it. Background jobs keep running while it's closed."""
+
+    closeRequested = pyqtSignal()
+
+    MIN_WIDTH = 480
+    MAX_WIDTH = 620
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("toolDrawer")
+        self.current_kind = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 18, 16)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        self.title_label = QLabel("")
+        self.title_label.setObjectName("drawerTitle")
+        self.summary_label = QLabel("")
+        self.summary_label.setObjectName("pageSubtitle")
+        title_col.addWidget(self.title_label)
+        title_col.addWidget(self.summary_label)
+        header.addLayout(title_col, stretch=1)
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("drawerClose")
+        close_btn.setToolTip("Close (Esc)")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.closeRequested.emit)
+        header.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(header)
+
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack, stretch=1)
+        self._pages: dict[str, QWidget] = {}
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(36)
+        shadow.setOffset(-6, 0)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        self.setGraphicsEffect(shadow)
+        self.hide()
+
+    def add_page(self, kind: str, page: QWidget):
+        self._pages[kind] = page
+        self.stack.addWidget(page)
+
+    def show_tool(self, kind: str):
+        self.current_kind = kind
+        title, summary = TOOL_PAGES[kind]
+        self.title_label.setText(title)
+        self.summary_label.setText(summary)
+        self.stack.setCurrentWidget(self._pages[kind])
+        self.reposition()
+        self.show()
+        self.raise_()
+
+    def close_drawer(self):
+        self.current_kind = None
+        self.hide()
+
+    def reposition(self):
+        host = self.parentWidget()
+        width = max(self.MIN_WIDTH, min(self.MAX_WIDTH, int(host.width() * 0.46)))
+        width = min(width, host.width())
+        self.setGeometry(host.width() - width, 0, width, host.height())
+
+
+# Tool pages: kind → (top bar title, top bar summary). The page itself no
+# longer carries a title — the top bar shows it, same as every other page.
+TOOL_PAGES = {
+    "merge": ("Merge", "Combine multi-part audiobooks into one file"),
+    "split": ("Split", "Chop files into fixed-length segments"),
+    "youtube": ("YouTube", "Download videos and playlists as mp3"),
+    "tags": ("Tags", "Edit title, artist, album, year, and artwork"),
+}
+LIBRARY_KINDS = ("songs", "audiobooks", "duplicates", "unsorted", "health")
+
+
 def tab_content(title: str) -> tuple[QWidget, QVBoxLayout]:
-    """Borderless content container for a sidebar-navigated page — the surrounding
-    content frame in _build_ui already supplies the border, so a nested panel()
-    frame here would double it up."""
+    """Borderless content container for a tool page. `title` is kept for
+    readability at the call sites; the visible title comes from the top bar
+    (TOOL_PAGES)."""
     widget = QWidget()
     layout = QVBoxLayout(widget)
-    layout.setContentsMargins(14, 12, 14, 14)
+    layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(10)
-    label = QLabel(title)
-    label.setObjectName("panelTitle")
-    layout.addWidget(label)
     return widget, layout
 
 
 def progress_row(cancel_slot) -> tuple[QHBoxLayout, LevelGauge, QPushButton]:
     row = QHBoxLayout()
     gauge = LevelGauge()
-    cancel_btn = QPushButton("CANCEL")
+    cancel_btn = QPushButton("Cancel")
     cancel_btn.setEnabled(False)
     cancel_btn.clicked.connect(cancel_slot)
     row.addWidget(gauge, stretch=1)
@@ -166,18 +250,26 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        layout.addLayout(self._build_header())
-        layout.addWidget(self._build_body(), stretch=1)
-
+        self.sidebar = Sidebar()
+        self.sidebar.navigate.connect(self._on_navigate)
+        self.sidebar.createRequested.connect(self._create_playlist)
+        self.sidebar.renameRequested.connect(self._rename_playlist)
         self.now_playing_bar = NowPlayingBar()
-        layout.addWidget(self.now_playing_bar)
+        self.now_playing_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.sidebar.set_player(self.now_playing_bar)
+        outer.addWidget(self.sidebar)
 
-        self.console_strip = self._build_console()
-        layout.addWidget(self.console_strip)
+        right = QWidget()
+        layout = QVBoxLayout(right)
+        layout.setContentsMargins(22, 16, 22, 14)
+        layout.setSpacing(12)
+        layout.addWidget(self._build_top_bar())
+        layout.addWidget(self._build_body(), stretch=1)
+        outer.addWidget(right, stretch=1)
 
         # Not added to root's layout — that's what lets it float over the
         # Rail+Deck+content column instead of being pushed around by it.
@@ -189,23 +281,7 @@ class MainWindow(QMainWindow):
 
     def _build_body(self) -> QWidget:
         self.body_widget = QWidget()
-        row = QHBoxLayout(self.body_widget)
-        row.setSpacing(14)
-
-        self.tool_rail = ToolRail()
-        self.tool_rail.navigate.connect(self._on_navigate)
-        self.tool_rail.tagsRequested.connect(self._open_batch_tags_fresh)
-        row.addWidget(self.tool_rail)
-
-        self.playlist_deck = PlaylistDeck()
-        self.playlist_deck.navigate.connect(self._on_navigate)
-        self.playlist_deck.createRequested.connect(self._create_playlist)
-        self.playlist_deck.renameRequested.connect(self._rename_playlist)
-        row.addWidget(self.playlist_deck)
-
-        content_frame = QFrame()
-        content_frame.setObjectName("panel")
-        content_layout = QVBoxLayout(content_frame)
+        content_layout = QVBoxLayout(self.body_widget)
         content_layout.setContentsMargins(0, 0, 0, 0)
 
         self.content_stack = QStackedWidget()
@@ -227,18 +303,30 @@ class MainWindow(QMainWindow):
         self.page_audiobook_series = AudiobookSeriesView(self._get_library_root)
         self.page_audiobook_series.fixTagsRequested.connect(self._fix_tags_for_path)
         self.page_audiobook_series.backRequested.connect(self._return_to_audiobooks)
+        self.page_audiobook_series.libraryChanged.connect(lambda: self.page_library.refresh())
         self.page_merge = self._build_merge_panel()
         self.page_split = self._build_split_panel()
         self.page_youtube = self._build_youtube_panel()
         self.page_tags = self._build_metadata_panel()
-        pages = (self.page_library, self.page_playlist, self.page_audiobook_series,
-                 self.page_merge, self.page_split, self.page_youtube, self.page_tags)
-        for page in pages:
+        for page in (self.page_library, self.page_playlist, self.page_audiobook_series):
             self.content_stack.addWidget(page)
         content_layout.addWidget(self.content_stack)
-        row.addWidget(content_frame, stretch=1)
 
-        self.tool_rail.select("library")
+        self.tool_drawer = ToolDrawer(self.body_widget)
+        for kind, page in (("merge", self.page_merge), ("split", self.page_split),
+                           ("youtube", self.page_youtube), ("tags", self.page_tags)):
+            self.tool_drawer.add_page(kind, page)
+        self.tool_drawer.closeRequested.connect(self._close_tool_drawer)
+        self.body_widget.installEventFilter(self)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self._close_tool_drawer)
+
+        self.page_library.countsChanged.connect(self.sidebar.set_counts)
+        self.page_library.headerChanged.connect(self._on_library_header_changed)
+        self.page_library.sub_tabs.currentChanged.connect(self._on_library_section_changed)
+        self.library_more_btn.setMenu(self.page_library.library_menu)
+        self.page_library.refresh()  # re-emit counts/header now that they're connected
+
+        self._on_navigate("songs", None)
         self._refresh_sidebar_playlists()
         return self.body_widget
 
@@ -251,7 +339,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_sidebar_playlists(self):
         if not self.library_root or not Path(self.library_root).exists():
-            self.playlist_deck.set_playlists([])
+            self.sidebar.set_playlists([])
         else:
             from .library.playlists import find_playlist_artwork
             from .library_view import playlist_mosaic_art
@@ -278,7 +366,7 @@ class MainWindow(QMainWindow):
                         self._playlist_mosaic_cache[p["id"]] = (signature, art_bytes)
                 playlists.append((p["id"], p["name"], art_bytes))
             conn.close()
-            self.playlist_deck.set_playlists(playlists)
+            self.sidebar.set_playlists(playlists)
         self._refresh_playlist_combo(self.youtube_playlist_combo)
         self._refresh_playlist_combo(self.merge_playlist_combo)
 
@@ -317,7 +405,7 @@ class MainWindow(QMainWindow):
         self._loudness_worker.start()
 
     def _on_loudness_progress(self, current: int, total: int):
-        text = f"ANALYZING LOUDNESS ({current:,}/{total:,})"
+        text = f"Analyzing loudness ({current:,}/{total:,})"
         self.console_strip.set_task_text(text)
         self.console_overlay.set_task_text(text)
 
@@ -356,7 +444,7 @@ class MainWindow(QMainWindow):
         self._health_worker.start()
 
     def _on_health_progress(self, current: int, total: int):
-        text = f"CHECKING ART ({current:,}/{total:,})"
+        text = f"Checking art ({current:,}/{total:,})"
         self.console_strip.set_task_text(text)
         self.console_overlay.set_task_text(text)
 
@@ -451,7 +539,7 @@ class MainWindow(QMainWindow):
             self.page_playlist.show_playlist(playlist_id, new_name)
 
     def _fix_tags_for_path(self, path: str, track_id: int):
-        self.tool_rail.select("tags")
+        self._on_navigate("tags", None)
         self._load_tag_file_from_path(path)
         # Loading always clears this; set it after, so saving knows to re-file
         # the track back into the library instead of just rewriting its ID3 tags.
@@ -470,82 +558,172 @@ class MainWindow(QMainWindow):
         self.tag_mode_tabs.setCurrentIndex(1)
 
     def _on_navigate(self, kind: str, payload):
+        """Single entry point for every page change — sidebar clicks, top
+        bar tool buttons, and programmatic jumps (Fix Tags, Send Segments
+        to Tags, Back from a series). Keeps the sidebar highlight, tool
+        button state and top bar title in step with what's showing."""
+        if kind == "library":
+            kind = "songs"
+
         if kind == "playlist":
-            self.tool_rail.deselect_all()
             playlist_id, name = payload
             self.page_playlist.show_playlist(playlist_id, name)
             self.content_stack.setCurrentWidget(self.page_playlist)
-            return
-
-        if kind == "audiobook_series":
-            self.tool_rail.deselect_all()
+            self.sidebar.select_playlist(playlist_id)
+            self._set_page_header("")  # the playlist page has its own big header
+        elif kind == "audiobook_series":
             self.page_audiobook_series.show_series(payload)  # payload = series (Album tag) name
             self.content_stack.setCurrentWidget(self.page_audiobook_series)
+            self.sidebar.select("audiobooks")
+            self._set_page_header("")
+        elif kind in LIBRARY_KINDS:
+            self.content_stack.setCurrentWidget(self.page_library)
+            self.page_library.show_section(kind)
+            self.sidebar.select(kind)
+            self._set_page_header(*self.page_library._section_header())
+        elif kind in TOOL_PAGES:
+            # Tools open in the drawer over whatever page you're on.
+            self.tool_drawer.show_tool(kind)
+            self._sync_tool_buttons()
+            return
+        else:
             return
 
-        self.playlist_deck.clear_selection()
-        pages = {
-            "library": self.page_library,
-            "merge": self.page_merge,
-            "split": self.page_split,
-            "youtube": self.page_youtube,
-            "tags": self.page_tags,
-        }
-        page = pages.get(kind)
-        if page is not None:
-            self.content_stack.setCurrentWidget(page)
+        self.library_more_btn.setVisible(kind in LIBRARY_KINDS)
+        self._sync_tool_buttons()
+
+    def _on_tool_button(self, kind: str):
+        """Top bar tool button: opens that tool in the drawer, or closes the
+        drawer if that tool is already showing."""
+        if self.tool_drawer.isVisible() and self.tool_drawer.current_kind == kind:
+            self._close_tool_drawer()
+            return
+        if kind == "tags":
+            # Opening Tags cold should never show a previous session's
+            # leftover batch files; the contextual entry points (Fix Tags,
+            # Send Segments to Tags) navigate directly instead.
+            self._open_batch_tags_fresh()
+        self._on_navigate(kind, None)
+
+    def _update_youtube_badge(self):
+        """"YouTube 3" on the top bar button while downloads are queued or
+        running, so progress is visible with the drawer closed."""
+        if not hasattr(self, "tool_buttons"):
+            return
+        try:
+            pending = self.youtube_queue_list.count() + (1 if self.youtube_active_worker is not None else 0)
+        except RuntimeError:
+            return  # window is shutting down and the queue list is already gone
+        btn = self.tool_buttons["youtube"]
+        btn.setText(f"YouTube  {pending}" if pending else "YouTube")
+        btn.setToolTip(f"{pending} download(s) left" if pending else TOOL_PAGES["youtube"][1])
+
+    def _close_tool_drawer(self):
+        self.tool_drawer.close_drawer()
+        self._sync_tool_buttons()
+
+    def _sync_tool_buttons(self):
+        open_kind = self.tool_drawer.current_kind if self.tool_drawer.isVisible() else None
+        for k, btn in self.tool_buttons.items():
+            btn.setChecked(k == open_kind)
+
+    def eventFilter(self, obj, event):
+        if obj is self.body_widget and event.type() == QEvent.Type.Resize:
+            if self.tool_drawer.isVisible():
+                self.tool_drawer.reposition()
+            if self.console_overlay.isVisible():
+                self._reposition_console_overlay()
+        return super().eventFilter(obj, event)
 
     def _return_to_audiobooks(self):
         """The audiobook series view's back button — returns to Library on
         the Audiobooks tab, with the SERIES sub-view active (where you'd
         have come from to get here in the first place)."""
-        self.tool_rail.select("library")
-        self.page_library.sub_tabs.setCurrentIndex(1)  # AUDIOBOOKS
-        self.page_library.audiobooks_view_toggle.setCurrentText("SERIES")
+        self._on_navigate("audiobooks", None)
+        self.page_library.audiobooks_view_toggle.setCurrentText("Series")
         self.content_stack.setCurrentWidget(self.page_library)
 
-    def _build_header(self):
-        outer = QVBoxLayout()
-        outer.setSpacing(6)
+    def _build_top_bar(self) -> QWidget:
+        """Page title + one-line summary on the left; the tools (used a lot,
+        but not part of browsing, so not in the sidebar) and the library /
+        output menus on the right."""
+        bar = QWidget()
+        bar.setObjectName("topBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
 
-        top_row = QHBoxLayout()
         title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        title = PixelLabel("SPLICE", point_size=22, color=ORANGE, letter_spacing=2)
-        subtitle = QLabel("AUDIO SPLICING UNIT // MK.III")
-        subtitle.setObjectName("appSubtitle")
-        title_col.addWidget(title)
-        title_col.addWidget(subtitle)
-        top_row.addLayout(title_col, stretch=1)
+        title_col.setSpacing(0)
+        self.page_title = QLabel("")
+        self.page_title.setObjectName("pageTitle")
+        self.page_subtitle = QLabel("")
+        self.page_subtitle.setObjectName("pageSubtitle")
+        title_col.addWidget(self.page_title)
+        title_col.addWidget(self.page_subtitle)
+        row.addLayout(title_col, stretch=1)
 
-        # Output folder used to be a permanently-visible bar; Merge/Split/YouTube
-        # only need it occasionally, so it's tucked behind a menu instead —
-        # same declutter pattern as the Library view's settings gear.
-        self.output_settings_btn = QPushButton("⚙ OUTPUT")
+        self.tool_buttons: dict[str, QPushButton] = {}
+        for kind, (label, summary) in TOOL_PAGES.items():
+            btn = QPushButton(label)
+            btn.setObjectName("toolButton")
+            btn.setCheckable(True)
+            btn.setToolTip(summary)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, k=kind: self._on_tool_button(k))
+            row.addWidget(btn)
+            self.tool_buttons[kind] = btn
+
+        row.addSpacing(6)
+        # Status dot + log toggle (used to be a full-width strip at the bottom).
+        self.console_strip = self._build_console()
+        row.addWidget(self.console_strip)
+        # Library-wide actions (Add sources, Export, library folder) — the
+        # menu itself belongs to LibraryView and is attached in _build_body.
+        self.library_more_btn = QPushButton("⋯")
+        self.library_more_btn.setObjectName("iconButton")
+        self.library_more_btn.setToolTip("Library: add sources, export, library folder")
+        row.addWidget(self.library_more_btn)
+
+        # Output folder for Merge/Split/YouTube — occasional, so it's a menu.
+        self.output_settings_btn = QPushButton("Output")
+        self.output_settings_btn.setObjectName("iconButton")
         self.output_menu = QMenu(self)
         self.output_location_action = QAction("", self)
         self.output_location_action.setEnabled(False)
-        choose_action = QAction("CHOOSE FOLDER...", self)
+        choose_action = QAction("Choose folder…", self)
         choose_action.triggered.connect(self._choose_output_dir)
-        open_action = QAction("OPEN FOLDER", self)
+        open_action = QAction("Open folder", self)
         open_action.triggered.connect(self._open_output_dir)
         self.output_menu.addAction(self.output_location_action)
         self.output_menu.addSeparator()
         self.output_menu.addAction(choose_action)
         self.output_menu.addAction(open_action)
         self.output_settings_btn.setMenu(self.output_menu)
-        top_row.addWidget(self.output_settings_btn, alignment=Qt.AlignmentFlag.AlignTop)
+        row.addWidget(self.output_settings_btn)
 
-        outer.addLayout(top_row)
-        rule = QFrame()
-        rule.setObjectName("rule")
-        outer.addWidget(rule)
         self._refresh_output_label()
-        return outer
+        return bar
+
+    def _set_page_header(self, title: str, subtitle: str = ""):
+        self.page_title.setText(title)
+        self.page_title.setVisible(bool(title))
+        self.page_subtitle.setText(subtitle)
+        self.page_subtitle.setVisible(bool(subtitle))
+
+    def _on_library_header_changed(self, title: str, subtitle: str):
+        if self.content_stack.currentWidget() is self.page_library:
+            self._set_page_header(title, subtitle)
+
+    def _on_library_section_changed(self, index: int):
+        """Keeps the sidebar highlight right when the section changes from
+        inside the library (e.g. Health's "Go to duplicates")."""
+        if self.content_stack.currentWidget() is self.page_library:
+            self.sidebar.select(self.page_library.current_section())
 
     def _refresh_output_label(self):
         text = self.output_dir if self.output_dir else "(no folder chosen yet)"
-        self.output_location_action.setText(f"Current: {text}")
+        self.output_location_action.setText(f"Output folder: {text}")
         self.output_settings_btn.setToolTip(text)
 
     def _build_merge_panel(self):
@@ -562,11 +740,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.merge_list)
 
         btn_row = QHBoxLayout()
-        up_btn = QPushButton("▲ UP")
-        down_btn = QPushButton("▼ DOWN")
-        remove_btn = QPushButton("REMOVE")
-        clear_btn = QPushButton("CLEAR")
-        self.merge_btn = QPushButton("MERGE")
+        up_btn = QPushButton("▲ Up")
+        down_btn = QPushButton("▼ Down")
+        remove_btn = QPushButton("Remove")
+        clear_btn = QPushButton("Clear")
+        self.merge_btn = QPushButton("Merge")
         self.merge_btn.setObjectName("primary")
 
         up_btn.clicked.connect(lambda: self._move_selected(-1))
@@ -644,7 +822,7 @@ class MainWindow(QMainWindow):
         row, self.split_progress, self.split_cancel_btn = progress_row(self._cancel_active)
         layout.addLayout(row)
 
-        self.send_to_tags_btn = QPushButton("SEND SEGMENTS TO TAGS")
+        self.send_to_tags_btn = QPushButton("Send segments to Tags")
         self.send_to_tags_btn.setEnabled(False)
         self.send_to_tags_btn.clicked.connect(self._send_split_segments_to_tags)
         layout.addWidget(self.send_to_tags_btn)
@@ -669,15 +847,17 @@ class MainWindow(QMainWindow):
         self.youtube_url_edit.setFixedHeight(70)
         layout.addWidget(self.youtube_url_edit)
 
-        add_row = QHBoxLayout()
-        self.youtube_download_btn = QPushButton("ADD TO QUEUE")
+        # Options stacked one per row (label | dropdown) so they fit the
+        # drawer's width; the main button sits under them.
+        options = QFormLayout()
+        options.setHorizontalSpacing(12)
+        options.setVerticalSpacing(8)
+        options.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.youtube_download_btn = QPushButton("Add to queue")
         self.youtube_download_btn.setObjectName("primary")
         self.youtube_download_btn.clicked.connect(self._add_to_youtube_queue)
-        add_row.addWidget(self.youtube_download_btn)
-        add_row.addStretch(1)
-        quality_label = QLabel("Quality:")
+        quality_label = QLabel("Quality")
         quality_label.setObjectName("muted")
-        add_row.addWidget(quality_label)
         self.youtube_quality_combo = QComboBox()
         self.youtube_quality_combo.addItem("Best (VBR, largest files)", "0")
         self.youtube_quality_combo.addItem("320 kbps", "320")
@@ -686,27 +866,29 @@ class MainWindow(QMainWindow):
         self.youtube_quality_combo.addItem("128 kbps (smaller files)", "128")
         self.youtube_quality_combo.setCurrentIndex(3)
         self.youtube_quality_combo.currentIndexChanged.connect(self._persist_youtube_quality)
-        add_row.addWidget(self.youtube_quality_combo)
+        options.addRow(quality_label, self.youtube_quality_combo)
 
-        destination_label = QLabel("File as:")
+        destination_label = QLabel("File as")
         destination_label.setObjectName("muted")
-        add_row.addWidget(destination_label)
         self.youtube_destination_combo = QComboBox()
         self.youtube_destination_combo.addItem("Music (library)", "music")
         self.youtube_destination_combo.addItem("Audiobook (library)", "audiobook")
         self.youtube_destination_combo.addItem("Output folder only", "output_only")
         self.youtube_destination_combo.currentIndexChanged.connect(self._on_youtube_destination_changed)
-        add_row.addWidget(self.youtube_destination_combo)
+        options.addRow(destination_label, self.youtube_destination_combo)
 
-        playlist_label = QLabel("Add to:")
+        playlist_label = QLabel("Add to playlist")
         playlist_label.setObjectName("muted")
-        add_row.addWidget(playlist_label)
         self.youtube_playlist_combo = QComboBox()
         self._refresh_playlist_combo(self.youtube_playlist_combo)
         self.youtube_playlist_combo.currentIndexChanged.connect(
             lambda idx: self._on_playlist_combo_changed(self.youtube_playlist_combo, idx)
         )
-        add_row.addWidget(self.youtube_playlist_combo)
+        options.addRow(playlist_label, self.youtube_playlist_combo)
+        layout.addLayout(options)
+        add_row = QHBoxLayout()
+        add_row.addStretch(1)
+        add_row.addWidget(self.youtube_download_btn)
         layout.addLayout(add_row)
 
         self.youtube_now_label = QLabel("Queue idle")
@@ -726,14 +908,17 @@ class MainWindow(QMainWindow):
         self.youtube_queue_list.setObjectName("filePicker")
         self.youtube_queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.youtube_queue_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.youtube_queue_list.setMaximumHeight(100)
+        self.youtube_queue_list.setMinimumHeight(90)
         self.youtube_queue_list.model().rowsMoved.connect(lambda *a: self._persist_youtube_queue())
+        for sig in (self.youtube_queue_list.model().rowsInserted, self.youtube_queue_list.model().rowsRemoved,
+                    self.youtube_queue_list.model().modelReset):
+            sig.connect(lambda *a: self._update_youtube_badge())
         layout.addWidget(self.youtube_queue_list)
 
         queue_btn_row = QHBoxLayout()
-        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn = QPushButton("Remove selected")
         remove_btn.clicked.connect(self._remove_selected_youtube_queue)
-        clear_btn = QPushButton("CLEAR QUEUE")
+        clear_btn = QPushButton("Clear queue")
         clear_btn.clicked.connect(self._clear_youtube_queue)
         queue_btn_row.addWidget(remove_btn)
         queue_btn_row.addWidget(clear_btn)
@@ -747,8 +932,8 @@ class MainWindow(QMainWindow):
         widget, layout = tab_content("TAGS MODULE — edit ID3 metadata (title, artist, album, year, art)")
 
         self.tag_mode_tabs = QTabWidget()
-        self.tag_mode_tabs.addTab(self._build_single_tag_panel(), "SINGLE FILE")
-        self.tag_mode_tabs.addTab(self._build_batch_tag_panel(), "BATCH APPLY")
+        self.tag_mode_tabs.addTab(self._build_single_tag_panel(), "Single file")
+        self.tag_mode_tabs.addTab(self._build_batch_tag_panel(), "Batch apply")
         layout.addWidget(self.tag_mode_tabs)
 
         return widget
@@ -762,7 +947,7 @@ class MainWindow(QMainWindow):
         self.single_tag_path_label = QLabel("(no file loaded)")
         self.single_tag_path_label.setObjectName("muted")
         self.single_tag_path_label.setWordWrap(True)
-        load_btn = QPushButton("LOAD MP3")
+        load_btn = QPushButton("Load mp3")
         load_btn.clicked.connect(self._load_single_tag_file)
         load_row.addWidget(self.single_tag_path_label, stretch=1)
         load_row.addWidget(load_btn)
@@ -790,7 +975,7 @@ class MainWindow(QMainWindow):
         art_col = QVBoxLayout()
         self.single_tag_art = CoverArtThumbnail()
         art_col.addWidget(self.single_tag_art)
-        art_btn = QPushButton("CHOOSE ARTWORK")
+        art_btn = QPushButton("Choose artwork")
         art_btn.clicked.connect(self._choose_single_tag_art)
         art_col.addWidget(art_btn)
         art_col.addStretch(1)
@@ -803,7 +988,7 @@ class MainWindow(QMainWindow):
 
         save_row = QHBoxLayout()
         save_row.addStretch(1)
-        self.tag_save_btn = QPushButton("SAVE")
+        self.tag_save_btn = QPushButton("Save")
         self.tag_save_btn.setObjectName("primary")
         self.tag_save_btn.setEnabled(False)
         self.tag_save_btn.clicked.connect(self._save_single_tag_file)
@@ -826,7 +1011,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setSpacing(8)
 
-        hint = QLabel("Drag mp3s in, click empty space in the list to browse, or use ADD FILES "
+        hint = QLabel("Drag mp3s in, click empty space in the list to browse, or use Add files "
                        "(e.g. all segments from one split), set shared fields, then apply. "
                        "Title is left untouched; track numbers are set 1, 2, 3... in list order.")
         hint.setObjectName("muted")
@@ -837,11 +1022,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.batch_tag_list)
 
         list_btn_row = QHBoxLayout()
-        add_btn = QPushButton("ADD FILES")
+        add_btn = QPushButton("Add files")
         add_btn.clicked.connect(self._add_batch_tag_files)
-        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn = QPushButton("Remove selected")
         remove_btn.clicked.connect(self.batch_tag_list.remove_selected)
-        clear_btn = QPushButton("CLEAR")
+        clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.batch_tag_list.clear)
         list_btn_row.addWidget(add_btn)
         list_btn_row.addWidget(remove_btn)
@@ -859,7 +1044,7 @@ class MainWindow(QMainWindow):
         art_col = QVBoxLayout()
         self.batch_tag_art = CoverArtThumbnail()
         art_col.addWidget(self.batch_tag_art)
-        art_btn = QPushButton("CHOOSE ARTWORK")
+        art_btn = QPushButton("Choose artwork")
         art_btn.clicked.connect(self._choose_batch_tag_art)
         art_col.addWidget(art_btn)
         art_col.addStretch(1)
@@ -870,7 +1055,7 @@ class MainWindow(QMainWindow):
         self.batch_tag_art_mime = None
 
         apply_row = QHBoxLayout()
-        self.batch_apply_btn = QPushButton("APPLY TO ALL")
+        self.batch_apply_btn = QPushButton("Apply to all")
         self.batch_apply_btn.setObjectName("primary")
         self.batch_apply_btn.clicked.connect(self._apply_batch_tags)
         apply_row.addStretch(1)
@@ -883,10 +1068,10 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return widget
 
-    def _build_console(self) -> ConsoleStrip:
-        strip = ConsoleStrip()
-        strip.clicked.connect(self._toggle_console)
-        return strip
+    def _build_console(self) -> LogButton:
+        button = LogButton()
+        button.clicked.connect(self._toggle_console)
+        return button
 
     # ---- shared behavior ----
 
@@ -901,13 +1086,12 @@ class MainWindow(QMainWindow):
         self.console_strip.set_expanded(expanding)
 
     def _reposition_console_overlay(self):
-        body_rect = self.body_widget.geometry()
-        rail_width = self.tool_rail.width()
-        x = body_rect.left() + rail_width
-        width = max(0, body_rect.width() - rail_width)
-        height = max(60, min(280, body_rect.height()))
-        y = body_rect.bottom() - height
-        self.console_overlay.setGeometry(x, y, width, height)
+        # Float over the bottom of the content area (not the sidebar).
+        top_left = self.body_widget.mapTo(self.centralWidget(), QPoint(0, 0))
+        width = self.body_widget.width()
+        height = max(60, min(280, self.body_widget.height()))
+        y = top_left.y() + self.body_widget.height() - height
+        self.console_overlay.setGeometry(top_left.x(), y, width, height)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1011,9 +1195,9 @@ class MainWindow(QMainWindow):
         self.batch_tag_cancel_btn.setEnabled(busy and kind == "batch_tag")
 
         if busy:
-            self._set_status("busy", "PROCESSING")
+            self._set_status("busy", "Processing")
         else:
-            self._set_status("standby", "STANDBY")
+            self._set_status("standby", "Standby")
             self.active_worker = None
             self.active_kind = None
 
@@ -1067,8 +1251,8 @@ class MainWindow(QMainWindow):
         self.merge_worker.start()
 
     def _on_merge_ok(self, out_path: str):
-        self.merge_progress.set_done("MERGE COMPLETE")
-        self._set_status("done", "MERGE COMPLETE")
+        self.merge_progress.set_done("Merge complete")
+        self._set_status("done", "Merge complete")
         self._set_busy(False)
         self.merge_list.clear()
 
@@ -1077,17 +1261,17 @@ class MainWindow(QMainWindow):
         self._file_into_library(out_path, playlist_id, kind)
 
         if self.merge_then_split_check.isChecked():
-            self.tool_rail.select("split")
+            self._on_navigate("split", None)
             self._run_split([out_path])
 
     def _on_merge_err(self, err: str):
-        self.merge_progress.set_error("MERGE FAILED")
-        self._set_status("error", "MERGE FAILED")
+        self.merge_progress.set_error("Merge failed")
+        self._set_status("error", "Merge failed")
         self._set_busy(False)
 
     def _on_merge_cancelled(self):
-        self.merge_progress.set_cancelled("CANCELLED")
-        self._set_status("error", "MERGE CANCELLED")
+        self.merge_progress.set_cancelled("Cancelled")
+        self._set_status("error", "Merge cancelled")
         self._set_busy(False)
 
     # ---- split behavior ----
@@ -1133,25 +1317,25 @@ class MainWindow(QMainWindow):
     def _on_split_file_progress(self, index: int, total: int, name: str):
         estimate = self._split_estimates[index - 1] if index - 1 < len(self._split_estimates) else None
         suffix = f"  (≈{estimate} segments)" if estimate else ""
-        self.split_file_label.setText(f"FILE {index} / {total} — {name}{suffix}")
+        self.split_file_label.setText(f"File {index} of {total}: {name}{suffix}")
 
     def _on_split_done(self, segment_paths: list):
-        self.split_progress.set_done("SPLIT COMPLETE")
-        self._set_status("done", "SPLIT COMPLETE")
+        self.split_progress.set_done("Split complete")
+        self._set_status("done", "Split complete")
         self._set_busy(False)
         self._last_split_segments = segment_paths
         self.send_to_tags_btn.setEnabled(bool(segment_paths))
 
     def _on_split_cancelled(self):
-        self.split_progress.set_cancelled("CANCELLED")
-        self._set_status("error", "SPLIT CANCELLED")
+        self.split_progress.set_cancelled("Cancelled")
+        self._set_status("error", "Split cancelled")
         self._set_busy(False)
 
     def _send_split_segments_to_tags(self):
         if not self._last_split_segments:
             return
         self.batch_tag_list.add_paths(self._last_split_segments)
-        self.tool_rail.select("tags")
+        self._on_navigate("tags", None)
         self.tag_mode_tabs.setCurrentIndex(1)  # BATCH APPLY sub-tab
         self._write_log(f"[{ts()}] Sent {len(self._last_split_segments)} segment(s) to Tags -> Batch Apply.")
 
@@ -1269,6 +1453,7 @@ class MainWindow(QMainWindow):
             self.youtube_progress.set_idle()
             self.youtube_worker = YouTubeWorker(data["url"], self.output_dir, data.get("quality", "192"))
             self.youtube_active_worker = self.youtube_worker
+            self._update_youtube_badge()
             self.youtube_worker.log.connect(self._write_log)
             self.youtube_worker.progress.connect(self.youtube_progress.set_progress)
             self.youtube_worker.finished_ok.connect(self._on_youtube_ok)
@@ -1289,8 +1474,9 @@ class MainWindow(QMainWindow):
             self.youtube_active_worker.cancel()
 
     def _on_youtube_ok(self, out_path: str):
-        self.youtube_progress.set_done("COMPLETE")
+        self.youtube_progress.set_done("Complete")
         self.youtube_active_worker = None
+        self._update_youtube_badge()
         self._file_into_library(out_path, self._current_download_playlist_id, self._current_download_kind or "music")
         self._pump_youtube_queue()
 
@@ -1339,13 +1525,15 @@ class MainWindow(QMainWindow):
             self.page_library.refresh()
 
     def _on_youtube_err(self, err: str):
-        self.youtube_progress.set_error("FAILED")
+        self.youtube_progress.set_error("Failed")
         self.youtube_active_worker = None
+        self._update_youtube_badge()
         self._pump_youtube_queue()
 
     def _on_youtube_cancelled(self):
-        self.youtube_progress.set_cancelled("CANCELLED")
+        self.youtube_progress.set_cancelled("Cancelled")
         self.youtube_active_worker = None
+        self._update_youtube_badge()
         self._pump_youtube_queue()
 
     def _persist_youtube_quality(self):
@@ -1457,10 +1645,10 @@ class MainWindow(QMainWindow):
             tagging.write_tags(self.single_tag_path, fields, self.single_tag_art_bytes, self.single_tag_art_mime)
         except Exception as e:
             self._write_log(f"[{ts()}] TAGS FAILED: {e}")
-            self._set_status("error", "TAG SAVE FAILED")
+            self._set_status("error", "Tag save failed")
             return
         self._write_log(f"[{ts()}] Tags saved -> {Path(self.single_tag_path).name}")
-        self._set_status("done", "TAGS SAVED")
+        self._set_status("done", "Tags saved")
 
         if self._pending_library_refile is not None:
             track_id = self._pending_library_refile
@@ -1566,12 +1754,12 @@ class MainWindow(QMainWindow):
             self.batch_tag_progress.set_progress(int(i / total * 100))
 
         if cancelled:
-            self.batch_tag_progress.set_cancelled("CANCELLED")
+            self.batch_tag_progress.set_cancelled("Cancelled")
             self._write_log(f"[{ts()}]   Cancelled — already-tagged files above were left as tagged.")
-            self._set_status("error", "BATCH TAGGING CANCELLED")
+            self._set_status("error", "Batch tagging cancelled")
         else:
-            self.batch_tag_progress.set_done("COMPLETE")
-            self._set_status("done", "BATCH TAGGING COMPLETE")
+            self.batch_tag_progress.set_done("Complete")
+            self._set_status("done", "Batch tagging complete")
         self._set_busy(False)
 
 
@@ -1580,6 +1768,7 @@ def main():
     app.setStyle("Fusion")  # ensures the stylesheet renders consistently instead of
     # fighting the native macOS/Windows widget chrome (source of stray bezel artifacts)
     load_bundled_fonts()
+    app.setPalette(build_palette())
     app.setStyleSheet(STYLESHEET)
     window = MainWindow()
     window.show()

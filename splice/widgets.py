@@ -3,11 +3,12 @@
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QBuffer, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
+    QIcon,
     QFont,
     QFontMetrics,
     QMouseEvent,
@@ -36,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .styles import BORDER, CONSOLE, GREEN, INK, MUTED, ORANGE, PIXEL_FONT_FAMILY, RED, SURFACE
+from .styles import ACCENT, AMBER, BORDER, CONSOLE, DISPLAY_FONT_FAMILY, GREEN, INK, MUTED, ON_ACCENT, RED, SUNSET, SURFACE
 
 
 def extract_dropped_mp3s(event) -> list[str]:
@@ -66,7 +67,7 @@ class StatusDot(QLabel):
         self.set_state("standby")
 
     def set_state(self, state: str):
-        color = {"standby": MUTED, "busy": ORANGE, "done": GREEN, "error": RED}[state]
+        color = {"standby": MUTED, "busy": ACCENT, "done": GREEN, "error": RED}[state]
         self.setStyleSheet(f"background-color: {color}; border-radius: 6px;")
 
 
@@ -106,7 +107,7 @@ class LevelGauge(QWidget):
                 self._state = "indeterminate"
                 self._sweep_pos = 0
                 self._timer.start()
-            self._text = "WORKING"
+            self._text = "Working"
             self.update()
             return
         self._timer.stop()
@@ -115,20 +116,20 @@ class LevelGauge(QWidget):
         self._text = f"{pct}%"
         self.update()
 
-    def set_done(self, text: str = "COMPLETE"):
+    def set_done(self, text: str = "Complete"):
         self._timer.stop()
         self._state = "done"
         self._pct = 100
         self._text = text
         self.update()
 
-    def set_error(self, text: str = "FAILED"):
+    def set_error(self, text: str = "Failed"):
         self._timer.stop()
         self._state = "error"
         self._text = text
         self.update()
 
-    def set_cancelled(self, text: str = "CANCELLED"):
+    def set_cancelled(self, text: str = "Cancelled"):
         self._timer.stop()
         self._state = "cancelled"
         self._text = text
@@ -143,31 +144,44 @@ class LevelGauge(QWidget):
         pos = self._sweep_pos % period
         return pos if pos < self.SEGMENTS else period - pos
 
+    @staticmethod
+    def _sunset_color(t: float) -> QColor:
+        """t in 0..1 → a color along the teal → amber → coral ramp."""
+        stops = [QColor(c) for c in reversed(SUNSET)]  # teal, amber, coral
+        t = min(max(t, 0.0), 1.0) * (len(stops) - 1)
+        i = min(int(t), len(stops) - 2)
+        f = t - i
+        a, b = stops[i], stops[i + 1]
+        return QColor(
+            round(a.red() + (b.red() - a.red()) * f),
+            round(a.green() + (b.green() - a.green()) * f),
+            round(a.blue() + (b.blue() - a.blue()) * f),
+        )
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(CONSOLE))
-        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 7, 7)
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), self.height() / 2, self.height() / 2)
 
-        margin = 4
-        gap = 2
+        margin = 5
+        gap = 3
         n = self.SEGMENTS
         available_w = self.width() - margin * 2
         seg_w = (available_w - gap * (n - 1)) / n
         seg_h = self.height() - margin * 2
 
         lit_color = {
-            "progress": QColor(ORANGE),
-            "indeterminate": QColor(ORANGE),
+            "progress": QColor(ACCENT),
+            "indeterminate": QColor(ACCENT),
             "done": QColor(GREEN),
             "error": QColor(RED),
             "cancelled": QColor(RED),
-        }.get(self._state, QColor(ORANGE))
+        }.get(self._state, QColor(ACCENT))
 
         dim_color = QColor(BORDER)
-        dim_color.setAlpha(80)
 
         lit_count = 0
         if self._state in ("progress", "done"):
@@ -184,14 +198,26 @@ class LevelGauge(QWidget):
                 on = abs(i - sweep_index) <= 1
             else:
                 on = i < lit_count
-            painter.setBrush(lit_color if on else dim_color)
-            painter.drawRoundedRect(rect, 2, 2)
+            if on and self._state in ("progress", "indeterminate"):
+                # Sunset ramp across the meter: teal → amber → coral, like
+                # the green/yellow/red zones of an old VU meter.
+                painter.setBrush(self._sunset_color(i / max(1, n - 1)))
+            else:
+                painter.setBrush(lit_color if on else dim_color)
+            corner = min(seg_w, seg_h) / 2
+            painter.drawRoundedRect(rect, corner, corner)
 
         if self._text:
-            painter.setPen(QColor(INK))
+            # Dark outline under the label so it stays readable over any
+            # lit segment color.
             font = painter.font()
             font.setBold(True)
             font.setPointSize(9)
+            painter.setFont(font)
+            painter.setPen(QColor(CONSOLE))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                painter.drawText(self.rect().translated(dx, dy), Qt.AlignmentFlag.AlignCenter, self._text)
+            painter.setPen(QColor(INK))
             painter.setFont(font)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
 
@@ -213,14 +239,14 @@ class DropListWidget(QListWidget):
             f"QListWidget {{ border: 2px dashed {border_color}; border-radius: 12px; "
             f"background-color: {CONSOLE}; color: {INK}; padding: 4px; }}"
             f"QListWidget::item {{ padding: 4px 6px; border-radius: 4px; }}"
-            f"QListWidget::item:selected {{ background-color: {ORANGE}; color: #FFFFFF; }}"
+            f"QListWidget::item:selected {{ background-color: {ACCENT}; color: {ON_ACCENT}; }}"
         )
 
     def _set_idle_style(self):
         self.setStyleSheet(self._base_style(BORDER))
 
     def _set_hover_style(self):
-        self.setStyleSheet(self._base_style(ORANGE))
+        self.setStyleSheet(self._base_style(ACCENT))
 
     def _add_paths(self, paths: list[str]):
         for path in sorted(paths, key=natural_sort_key):
@@ -268,8 +294,8 @@ class DropListWidget(QListWidget):
 class SplitDropZone(QLabel):
     filesDropped = pyqtSignal(list)
 
-    IDLE_TEXT = "DRAG MP3 FILE(S) HERE, OR CLICK TO BROWSE"
-    HOVER_TEXT = "RELEASE TO SPLIT"
+    IDLE_TEXT = "Drag mp3 file(s) here, or click to browse"
+    HOVER_TEXT = "Release to split"
 
     def __init__(self):
         super().__init__(self.IDLE_TEXT)
@@ -288,7 +314,7 @@ class SplitDropZone(QLabel):
 
     def _set_hover_style(self):
         self.setStyleSheet(
-            f"border: 2px dashed {ORANGE}; border-radius: 12px; color: {ORANGE}; "
+            f"border: 2px dashed {ACCENT}; border-radius: 12px; color: {ACCENT}; "
             f"background-color: {CONSOLE}; letter-spacing: 1px;"
         )
 
@@ -368,7 +394,7 @@ class FilePickerList(QListWidget):
 class CoverArtThumbnail(QLabel):
     """Displays embedded cover art, or a placeholder when there is none."""
 
-    PLACEHOLDER_TEXT = "NO\nARTWORK"
+    PLACEHOLDER_TEXT = "No\nartwork"
 
     def __init__(self):
         super().__init__(self.PLACEHOLDER_TEXT)
@@ -402,89 +428,84 @@ class CoverArtThumbnail(QLabel):
         self.setText(self.PLACEHOLDER_TEXT)
 
 
-class PixelLabel(QLabel):
-    """A QLabel set in the bundled Silkscreen pixel font — genuine hand-
-    drawn pixel-grid glyphs, not a regular font faked into looking blocky.
-    Reserved for chrome/branding; actual data (track titles, artist names,
-    ...) stays in the app's normal Space Mono so it's legible. Silkscreen
-    is registered with Qt via styles.load_bundled_fonts() at startup, so
-    this just names it directly — no manual pixel-art rendering trick
-    needed once the real font is doing the work."""
+class DisplayLabel(QLabel):
+    """A QLabel set in the bundled Righteous display face — the rounded 70s
+    lettering used for chrome/branding (logo, page and section headings).
+    Actual data (track titles, artist names, ...) stays in the body font so
+    it's legible. Righteous is registered with Qt via
+    styles.load_bundled_fonts() at startup. It only ships one weight, so
+    `bold` is accepted for call-site compatibility but ignored — asking Qt
+    to fake-bold it just smears the letterforms."""
 
     def __init__(self, text: str = "", point_size: int = 13, color: str = INK,
                  bold: bool = True, letter_spacing: int = 1):
         super().__init__(text)
         # letter-spacing has no QSS equivalent, so it has to come from a
-        # QFont via setFont() — but font-family/size/weight from setFont()
-        # get silently overridden by the app-wide stylesheet's QWidget rule
+        # QFont via setFont() — but font-family/size from setFont() get
+        # silently overridden by the app-wide stylesheet's QWidget rule
         # (Qt's QSS cascade beats setFont() for any property it also sets),
-        # so those three are repeated in this label's own stylesheet, which
+        # so those are repeated in this label's own stylesheet, which
         # (being more specific) wins over the app-wide one.
-        font = QFont(PIXEL_FONT_FAMILY)
+        font = QFont(DISPLAY_FONT_FAMILY)
         font.setPointSize(point_size)
-        font.setBold(bold)
-        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter_spacing)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter_spacing * 0.5)
         self.setFont(font)
         self.setStyleSheet(
             f"color: {color}; background: transparent; "
-            f"font-family: '{PIXEL_FONT_FAMILY}'; font-size: {point_size}pt; "
-            f"font-weight: {'bold' if bold else 'normal'};"
+            f"font-family: '{DISPLAY_FONT_FAMILY}'; font-size: {point_size}pt; font-weight: normal;"
         )
 
 
-class ChamferedFrame(QFrame):
-    """A panel with one corner cut at 45°, matching Direction E's stat-card
-    shape language — QSS border-radius can't do an asymmetric single-corner
-    cut, so this paints its own background+border via QPainterPath, the
-    same custom-paint pattern LevelGauge uses above."""
+class SunsetStripe(QWidget):
+    """The coral / amber / teal bars that sit under the logo — the 70s
+    sunset signature. Purely decorative."""
 
-    def __init__(self, chamfer: int = 14, corner: str = "bottom-left",
+    def __init__(self, width: int = 72, height: int = 4):
+        super().__init__()
+        self.setFixedSize(width, height)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        gap = 3
+        n = len(SUNSET)
+        bar_w = (self.width() - gap * (n - 1)) / n
+        for i, color in enumerate(SUNSET):
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(QRectF(i * (bar_w + gap), 0, bar_w, self.height()), 2, 2)
+
+
+class RoundedFrame(QFrame):
+    """A panel with rounded corners, painted by hand (background + border)
+    so it can sit anywhere regardless of what the stylesheet says about
+    plain QFrames. `radius` sets the corner size; `corner` is accepted for
+    call-site compatibility with the old chamfered shape and ignored."""
+
+    def __init__(self, radius: int = 14, corner: str = "bottom-left",
                  background: str = SURFACE, border: str = BORDER):
         super().__init__()
-        self._chamfer = chamfer
-        self._corner = corner
+        self._radius = radius
         self._background = QColor(background)
         self._border = QColor(border)
-
-    def _path(self) -> QPainterPath:
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        c = self._chamfer
-        path = QPainterPath()
-        if self._corner == "bottom-left":
-            path.moveTo(r.left(), r.top())
-            path.lineTo(r.right(), r.top())
-            path.lineTo(r.right(), r.bottom())
-            path.lineTo(r.left() + c, r.bottom())
-            path.lineTo(r.left(), r.bottom() - c)
-            path.closeSubpath()
-        else:  # "top-left"
-            path.moveTo(r.left(), r.top() + c)
-            path.lineTo(r.left() + c, r.top())
-            path.lineTo(r.right(), r.top())
-            path.lineTo(r.right(), r.bottom())
-            path.lineTo(r.left(), r.bottom())
-            path.closeSubpath()
-        return path
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(self._border, 1))
         painter.setBrush(self._background)
-        painter.drawPath(self._path())
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), self._radius, self._radius)
 
 
-def render_chamfered_pixmap(
-    image_bytes: bytes | None, size: int, chamfer: int,
+def render_rounded_pixmap(
+    image_bytes: bytes | None, size: int, radius: int,
     border_color: str = BORDER, background: str = CONSOLE, muted: str = MUTED,
 ) -> QPixmap:
-    """A size x size square with one corner cut at 45° (matching
-    ChamferedFrame's stat-card shape), filled with image_bytes cropped to
-    cover, or a recessed "NO ARTWORK" placeholder if there's no image yet.
-    Used at three scales for playlist artwork: a small Playlist Deck row
-    icon, a larger PlaylistView header tile, and — sized for later, not
-    built yet — a now-playing bar's mini art, so all three read as the same
-    object rather than three separately-invented treatments."""
+    """A size x size rounded square filled with image_bytes cropped to
+    cover, or a recessed "No artwork" placeholder if there's no image yet.
+    Used at every scale artwork appears (sidebar playlist icons, playlist
+    and series header tiles, audiobook shelf, now-playing art) so they all
+    read as the same object."""
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -492,12 +513,7 @@ def render_chamfered_pixmap(
 
     r = QRectF(0, 0, size, size).adjusted(0.5, 0.5, -0.5, -0.5)
     path = QPainterPath()
-    path.moveTo(r.left(), r.top() + chamfer)
-    path.lineTo(r.left() + chamfer, r.top())
-    path.lineTo(r.right(), r.top())
-    path.lineTo(r.right(), r.bottom())
-    path.lineTo(r.left(), r.bottom())
-    path.closeSubpath()
+    path.addRoundedRect(r, radius, radius)
 
     image = None
     if image_bytes:
@@ -521,9 +537,9 @@ def render_chamfered_pixmap(
     if image is None and size >= 60:
         painter.setPen(QColor(muted))
         font = QFont(painter.font())
-        font.setPointSize(8)
+        font.setPointSize(9)
         painter.setFont(font)
-        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "NO\nARTWORK")
+        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "No\nartwork")
 
     painter.end()
     return pixmap
@@ -535,7 +551,7 @@ def render_mosaic_bytes(cover_art_list: list[bytes]) -> bytes | None:
     idea Spotify/Apple Music use for auto-generated playlist covers.
     Returns raw PNG bytes so it slots into the exact same `image_bytes`
     parameter every artwork call site already passes to
-    render_chamfered_pixmap — nothing about the rendering pipeline itself
+    render_rounded_pixmap — nothing about the rendering pipeline itself
     needs to know a mosaic was involved. A single distinct cover is
     returned as-is (a "mosaic" of one image is pointless); with 2 or 3,
     covers repeat to fill all four quadrants rather than leaving dead
@@ -575,22 +591,22 @@ def render_mosaic_bytes(cover_art_list: list[bytes]) -> bytes | None:
     return bytes(buffer.data())
 
 
-class ChamferedArtTile(QLabel):
-    """A render_chamfered_pixmap(), kept in a QLabel so it can sit in a
+class RoundedArtTile(QLabel):
+    """A render_rounded_pixmap(), kept in a QLabel so it can sit in a
     layout like any other widget. clickable=True (the PlaylistView header
     tile) shows a pointing-hand cursor and an orange hover border, and emits
     clicked() instead of doing anything with the click itself — the caller
     owns what "click to change artwork" actually does (open a file dialog).
-    The Playlist Deck's small row icon isn't a ChamferedArtTile — that one
+    The Playlist Deck's small row icon isn't a RoundedArtTile — that one
     goes through QListWidgetItem.setIcon() instead, since deck rows are
     list items, not widgets."""
 
     clicked = pyqtSignal()
 
-    def __init__(self, size: int = 96, chamfer: int = 16, clickable: bool = False):
+    def __init__(self, size: int = 96, radius: int = 16, clickable: bool = False):
         super().__init__()
         self._size = size
-        self._chamfer = chamfer
+        self._radius = radius
         self._clickable = clickable
         self._image_bytes = None
         self._hovering = False
@@ -608,8 +624,8 @@ class ChamferedArtTile(QLabel):
         self.set_art(None)
 
     def _render(self):
-        border = ORANGE if (self._clickable and self._hovering) else BORDER
-        self.setPixmap(render_chamfered_pixmap(self._image_bytes, self._size, self._chamfer, border_color=border))
+        border = ACCENT if (self._clickable and self._hovering) else BORDER
+        self.setPixmap(render_rounded_pixmap(self._image_bytes, self._size, self._radius, border_color=border))
 
     def enterEvent(self, event):
         if self._clickable:
@@ -630,34 +646,28 @@ class ChamferedArtTile(QLabel):
         super().mousePressEvent(event)
 
 
-class TileInfoButton(QAbstractButton):
-    """Small circular info affordance overlaid on a standalone-book tile's
-    art (series tiles don't get one — they navigate into the series, not
-    open Track Info for a single track). Draws the same vector dot+stem-free
-    plus glyph TrackRowDelegate paints for its per-row info icon, so both
-    routes to Track Info read as the same affordance — this one's a real
-    child QWidget rather than a painted hit-zone since a shelf tile has no
-    delegate to paint through."""
+class TileMenuButton(QAbstractButton):
+    """Small round ⋯ button overlaid on a shelf tile's art — opens the
+    tile's action menu (same menu as right-clicking the tile). Painted dots
+    rather than a "⋯" glyph, which renders inconsistently across fonts."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(22, 22)
+        self.setFixedSize(26, 26)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("More actions")
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(ORANGE) if self.underMouse() else QColor(28, 30, 34, 190))
+        painter.setBrush(QColor(ACCENT) if self.underMouse() else QColor(11, 16, 26, 210))
         painter.drawEllipse(rect)
+        painter.setBrush(QColor(ON_ACCENT) if self.underMouse() else QColor(INK))
         cx, cy = rect.center().x(), rect.center().y()
-        pen = QPen(QColor("white"), 1.6)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        half = 4.0
-        painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
-        painter.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
+        for dx in (-5.5, 0, 5.5):
+            painter.drawEllipse(QPointF(cx + dx, cy), 1.6, 1.6)
 
 
 class BookShelfTile(QWidget):
@@ -665,12 +675,13 @@ class BookShelfTile(QWidget):
     the whole widget clickable (not just the art). Used for both series
     tiles (art = the series' own artwork, subtitle = book count) and
     standalone-book tiles (art = that book's own embedded art, subtitle =
-    author). Reuses ChamferedArtTile/render_chamfered_pixmap unmodified —
+    author). Reuses RoundedArtTile/render_rounded_pixmap unmodified —
     square, not the mockup's portrait 3:4 covers, a deliberate scope cut to
     avoid widening a renderer three other things already depend on."""
 
     clicked = pyqtSignal()
     infoClicked = pyqtSignal()
+    menuRequested = pyqtSignal(QPoint)  # global position — ⋯ button or right-click
 
     def __init__(self, art_bytes: bytes | None, title: str, subtitle: str, size: int = 120, show_info: bool = False):
         super().__init__()
@@ -679,18 +690,22 @@ class BookShelfTile(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self.art = ChamferedArtTile(size=size, chamfer=16, clickable=False)
+        self.art = RoundedArtTile(size=size, radius=16, clickable=False)
         self.art.set_art(art_bytes)
         layout.addWidget(self.art)
 
-        if show_info:
-            # A real child widget positioned over the art tile's corner —
-            # Qt dispatches the click to this button, not up to the tile's
-            # own mousePressEvent, so it can't also trigger playback.
-            info_btn = TileInfoButton(self.art)
-            info_btn.move(size - info_btn.width() - 6, 6)
-            info_btn.raise_()
-            info_btn.clicked.connect(lambda checked=False: self.infoClicked.emit())
+        # A real child widget over the art's corner — Qt delivers the click
+        # to this button, not to the tile's own mousePressEvent, so opening
+        # the menu can't also open/play the tile. Shown on hover only.
+        self.menu_btn = TileMenuButton(self.art)
+        self.menu_btn.move(size - self.menu_btn.width() - 6, 6)
+        self.menu_btn.raise_()
+        self.menu_btn.hide()
+        self.menu_btn.clicked.connect(
+            lambda checked=False: self.menuRequested.emit(
+                self.menu_btn.mapToGlobal(QPoint(0, self.menu_btn.height() + 2))
+            )
+        )
 
         title_label = QLabel(title)
         title_label.setWordWrap(True)
@@ -701,6 +716,17 @@ class BookShelfTile(QWidget):
         subtitle_label.setObjectName("muted")
         subtitle_label.setWordWrap(True)
         layout.addWidget(subtitle_label)
+
+    def enterEvent(self, event):
+        self.menu_btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.menu_btn.hide()
+        super().leaveEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.menuRequested.emit(event.globalPos())
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -721,6 +747,8 @@ class AudiobookShelfWidget(QWidget):
     seriesActivated = pyqtSignal(str)  # series (Album tag) name
     playRequested = pyqtSignal(list, int)  # standalone tile clicked — same contract LibraryView.playRequested uses
     infoRequested = pyqtSignal(int)  # standalone tile's info icon clicked — track_id
+    seriesMenuRequested = pyqtSignal(str, QPoint)  # series name, global pos — ⋯ / right-click on a series tile
+    bookMenuRequested = pyqtSignal(dict, QPoint)  # standalone entry dict, global pos — same for a standalone tile
 
     COLUMNS = 4
 
@@ -773,6 +801,7 @@ class AudiobookShelfWidget(QWidget):
         for name, subtitle, art_bytes in series_entries:
             tile = BookShelfTile(art_bytes, name, subtitle)
             tile.clicked.connect(lambda checked=False, n=name: self.seriesActivated.emit(n))
+            tile.menuRequested.connect(lambda pos, n=name: self.seriesMenuRequested.emit(n, pos))
             place(tile)
 
         for entry in standalone_entries:
@@ -781,6 +810,7 @@ class AudiobookShelfWidget(QWidget):
             )
             tile.clicked.connect(lambda checked=False, e=entry: self._play_standalone(e))
             tile.infoClicked.connect(lambda tid=entry["id"]: self.infoRequested.emit(tid))
+            tile.menuRequested.connect(lambda pos, e=entry: self.bookMenuRequested.emit(e, pos))
             place(tile)
 
         self._grid.setRowStretch(row + 1, 1)  # keep tiles pinned to the top when they don't fill the scroll area
@@ -817,9 +847,37 @@ class TrackRowDelegate(QStyledItemDelegate):
     rather than a "0")."""
 
     ROW_HEIGHT = 46
+    COLUMN_ROW_HEIGHT = 34
     PADDING_X = 14
     INFO_ICON_SIZE = 20
     THUMB_SIZE = 34
+    RIGHT_ZONE = 84  # reserved for the info icon + playlist badge in column mode, so columns line up row to row
+    COLUMN_GAP = 14
+
+    @staticmethod
+    def column_rects(row_rect: QRect, columns: list) -> list[QRect]:
+        """Splits a row into one rect per column (columns: list of
+        (key, label, width_fraction)). Shared by paint() and
+        TrackColumnHeader so header labels sit exactly over their column."""
+        left = row_rect.left() + TrackRowDelegate.PADDING_X
+        right = row_rect.right() - TrackRowDelegate.PADDING_X - TrackRowDelegate.RIGHT_ZONE
+        gap = TrackRowDelegate.COLUMN_GAP
+        available = max(0, right - left - gap * (len(columns) - 1))
+        total = sum(c[2] for c in columns) or 1
+        rects, x = [], left
+        for key, label, frac in columns:
+            w = int(available * frac / total)
+            rects.append(QRect(x, row_rect.top(), w, row_rect.height()))
+            x += w + gap
+        return rects
+
+    @staticmethod
+    def in_column_rect(row_rect: QRect) -> QRect:
+        """Where the playlist-count badge sits in column mode — the header
+        puts its "In" label here."""
+        return QRect(
+            row_rect.right() - TrackRowDelegate.PADDING_X - 40, row_rect.top(), 40, row_rect.height()
+        )
 
     @staticmethod
     def thumbnail_rect(row_rect: QRect) -> QRect:
@@ -885,29 +943,29 @@ class TrackRowDelegate(QStyledItemDelegate):
 
         if selected:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(ORANGE))
-            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
+            painter.setBrush(QColor(ACCENT))
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
         elif hovered:
-            tint = QColor(ORANGE)
+            tint = QColor(ACCENT)
             tint.setAlpha(24)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(tint)
-            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 8, 8)
 
         if playing and not selected:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(ORANGE))
+            painter.setBrush(QColor(ACCENT))
             painter.drawRoundedRect(QRect(rect.left() + 2, rect.top() + 6, 3, rect.height() - 12), 1, 1)
 
-        text_color = QColor("#FFFFFF") if selected else QColor(ORANGE) if playing else QColor(INK)
-        muted_color = QColor("#FFFFFF") if selected else QColor(MUTED)
+        text_color = QColor(ON_ACCENT) if selected else QColor(ACCENT) if playing else QColor(INK)
+        muted_color = QColor(ON_ACCENT) if selected else QColor(MUTED)
 
         badge_width = self._badge_width(option.font, badge)
         if badge:
             badge_rect = QRect(
                 rect.right() - self.PADDING_X - badge_width, rect.center().y() - 10, badge_width, 20
             )
-            pen_color = QColor("#FFFFFF") if selected else QColor(ORANGE)
+            pen_color = QColor(ON_ACCENT) if selected else QColor(ACCENT)
             badge_font = _resized_font(option.font, -1)
             painter.setFont(badge_font)
             painter.setPen(QPen(pen_color, 1))
@@ -917,7 +975,7 @@ class TrackRowDelegate(QStyledItemDelegate):
             painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge)
 
         info_rect = self.info_icon_rect(rect, option.font, badge)
-        icon_color = QColor("#FFFFFF") if selected else QColor(ORANGE)
+        icon_color = QColor(ON_ACCENT) if selected else QColor(ACCENT)
         painter.setPen(QPen(icon_color, 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(info_rect)
@@ -932,6 +990,12 @@ class TrackRowDelegate(QStyledItemDelegate):
         half = 4.0
         painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
         painter.drawLine(QPointF(cx, cy - half), QPointF(cx, cy + half))
+
+        columns = getattr(self.parent(), "columns", None)
+        if columns:
+            self._paint_columns(painter, option, rect, data, columns, text_color, muted_color)
+            painter.restore()
+            return
 
         icon = index.data(Qt.ItemDataRole.DecorationRole)
         text_left = rect.left() + self.PADDING_X
@@ -958,9 +1022,24 @@ class TrackRowDelegate(QStyledItemDelegate):
 
         painter.restore()
 
+    def _paint_columns(self, painter, option, rect, data, columns, text_color, muted_color):
+        """Single-line table row: the title column in the primary text
+        color, the rest muted, each elided to its own width."""
+        for col_rect, (key, _label, _frac) in zip(self.column_rects(rect, columns), columns):
+            value = str(data.get(key) or "")
+            font = QFont(option.font)
+            primary = key == "title"
+            if primary:
+                font.setWeight(QFont.Weight.Medium)
+            painter.setFont(font)
+            painter.setPen(text_color if primary else muted_color)
+            elided = painter.fontMetrics().elidedText(value, Qt.TextElideMode.ElideRight, col_rect.width())
+            painter.drawText(col_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+
     def sizeHint(self, option, index) -> QSize:
         size = super().sizeHint(option, index)
-        return QSize(size.width(), self.ROW_HEIGHT)
+        columns = getattr(self.parent(), "columns", None)
+        return QSize(size.width(), self.COLUMN_ROW_HEIGHT if columns else self.ROW_HEIGHT)
 
 
 class TrackListWidget(QListWidget):
@@ -975,9 +1054,41 @@ class TrackListWidget(QListWidget):
     infoClicked = pyqtSignal(int)
     thumbnailClicked = pyqtSignal(int)
 
-    def __init__(self):
+    def __init__(self, columns: list | None = None):
         super().__init__()
         self._playing_id: int | None = None
+        # None = the two-line card rows; a list of (key, label, fraction)
+        # = single-line table rows (see TrackRowDelegate.column_rects).
+        self.columns = columns
+        # Set by the owning view (returns the library folder) to let rows be
+        # dragged out as files — into Merge, Split or Tags. See enable_file_drag.
+        self.library_root_getter = None
+
+    def enable_file_drag(self, library_root_getter):
+        """Lets selected rows be dragged out as mp3 files. Copy-only on
+        purpose: a drag that allowed "move" could let a file manager move a
+        file out of the library."""
+        self.library_root_getter = library_root_getter
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+
+    def mimeData(self, items):
+        data = super().mimeData(items)
+        root = self.library_root_getter() if self.library_root_getter else None
+        if root and self.dragDropMode() == QAbstractItemView.DragDropMode.DragOnly:
+            urls = []
+            for item in items:
+                info = item.data(Qt.ItemDataRole.UserRole) or {}
+                if info.get("library_path"):
+                    urls.append(QUrl.fromLocalFile(str(Path(root) / info["library_path"])))
+            data.setUrls(urls)
+        return data
+
+    def startDrag(self, supported_actions):
+        if self.dragDropMode() == QAbstractItemView.DragDropMode.DragOnly:
+            supported_actions = Qt.DropAction.CopyAction
+        super().startDrag(supported_actions)
 
     def set_playing_track(self, track_id: int | None):
         """track_id of the row to paint with the now-playing accent, or None
@@ -1052,6 +1163,63 @@ class TrackListWidget(QListWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class TrackColumnHeader(QWidget):
+    """Clickable column labels sitting directly above a column-mode
+    TrackListWidget. Click a label to sort by it; click it again to flip
+    the direction. Positions its labels with the same
+    TrackRowDelegate.column_rects() the rows are painted with, re-run
+    whenever the list's viewport resizes (e.g. a scrollbar appears)."""
+
+    sortRequested = pyqtSignal(str)  # column key
+
+    def __init__(self, track_list: TrackListWidget, sortable_keys: set[str], show_in: bool = True):
+        super().__init__()
+        self.setObjectName("columnHeader")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(30)
+        self._list = track_list
+        self._buttons: dict[str, QPushButton] = {}
+        self._labels: dict[str, str] = {}
+        extra = [("in", "In", 0)] if show_in else []
+        for key, label, _frac in list(track_list.columns) + extra:
+            btn = QPushButton(label, self)
+            btn.setObjectName("columnHeaderButton")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            if key in sortable_keys:
+                btn.clicked.connect(lambda checked=False, k=key: self.sortRequested.emit(k))
+            else:
+                btn.setEnabled(False)
+            self._buttons[key] = btn
+            self._labels[key] = label
+        track_list.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            self._relayout()
+        return False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self):
+        viewport = self._list.viewport()
+        x_offset = viewport.mapTo(self._list, QPoint(0, 0)).x()
+        row = QRect(x_offset, 0, viewport.width(), self.height())
+        for rect, (key, _l, _f) in zip(TrackRowDelegate.column_rects(row, self._list.columns), self._list.columns):
+            self._buttons[key].setGeometry(rect)
+        if "in" in self._buttons:
+            self._buttons["in"].setGeometry(TrackRowDelegate.in_column_rect(row))
+
+    def set_sort(self, key: str, ascending: bool):
+        for k, btn in self._buttons.items():
+            active = k == key
+            btn.setText(self._labels[k] + ((" ↑" if ascending else " ↓") if active else ""))
+            btn.setProperty("sorted", active)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+
 def _format_ms(ms: int) -> str:
     """M:SS for a player position/duration in milliseconds. Distinct from
     library_view.py's _format_duration (that one formats DB seconds, and
@@ -1060,10 +1228,61 @@ def _format_ms(ms: int) -> str:
     return f"{total_seconds // 60}:{total_seconds % 60:02d}"
 
 
+class LogButton(QPushButton):
+    """Top bar button that opens the log — replaces the full-width status
+    strip that used to sit at the bottom of the window. A colored dot shows
+    the shared status (grey standby, amber busy, teal done, red error);
+    while a background task (loudness analysis, art check) runs, its
+    progress text shows on the button itself. Same set_status /
+    set_task_text / set_expanded / clicked interface ConsoleStrip has, so
+    MainWindow can use either."""
+
+    _DOT_COLORS = {"standby": MUTED, "busy": AMBER, "done": GREEN, "error": RED}
+
+    def __init__(self):
+        super().__init__("Log")
+        self.setObjectName("logButton")
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._status_text = "Standby"
+        self._task_text = ""
+        self.set_status("standby", "Standby")
+
+    def _dot_icon(self, color: str) -> QIcon:
+        pm = QPixmap(10, 10)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color))
+        p.drawEllipse(QRectF(1, 1, 8, 8))
+        p.end()
+        return QIcon(pm)
+
+    def set_status(self, state: str, text: str):
+        self._status_text = text
+        self.setIcon(self._dot_icon(self._DOT_COLORS.get(state, MUTED)))
+        self._refresh()
+
+    def set_task_text(self, text: str):
+        self._task_text = text
+        self._refresh()
+
+    def set_expanded(self, expanded: bool):
+        self.setChecked(expanded)
+
+    def _refresh(self):
+        self.setText(self._task_text or "Log")
+        tip = f"Status: {self._status_text}"
+        if self._task_text:
+            tip += f"\n{self._task_text}"
+        self.setToolTip(tip + "\nClick to show or hide the log")
+
+
 class ConsoleStrip(QFrame):
     """Thin clickable status strip — the console's collapsed state. QFrame
     has no built-in click signal, so mousePressEvent is overridden to emit
-    one, same pattern ChamferedArtTile uses for its own click affordance."""
+    one, same pattern RoundedArtTile uses for its own click affordance."""
 
     clicked = pyqtSignal()
 
@@ -1075,7 +1294,7 @@ class ConsoleStrip(QFrame):
         row.setContentsMargins(10, 5, 10, 5)
         row.setSpacing(8)
         self.status_dot = StatusDot()
-        self.status_label = QLabel("STANDBY")
+        self.status_label = QLabel("Standby")
         self.status_label.setObjectName("muted")
         # Separate from status_dot/status_label on purpose — those are the
         # single shared indicator Merge/Split/Tags treat as mutually
@@ -1086,7 +1305,7 @@ class ConsoleStrip(QFrame):
         # widget rather than sharing this strip too.
         self.task_label = QLabel("")
         self.task_label.setObjectName("muted")
-        self._hint = QLabel("CLICK TO EXPAND ▴")
+        self._hint = QLabel("Click to expand ▴")
         self._hint.setObjectName("muted")
         row.addWidget(self.status_dot)
         row.addWidget(self.status_label)
@@ -1102,7 +1321,7 @@ class ConsoleStrip(QFrame):
         self.task_label.setText(text)
 
     def set_expanded(self, expanded: bool):
-        self._hint.setText("CLICK TO COLLAPSE ▾" if expanded else "CLICK TO EXPAND ▴")
+        self._hint.setText("Click to collapse ▾" if expanded else "Click to expand ▴")
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1150,18 +1369,18 @@ class TransportButton(QAbstractButton):
         if not self.isEnabled():
             bg, border, icon_color = QColor(SURFACE), QColor(BORDER), QColor(BORDER)
         elif self.isChecked():
-            bg = QColor(ORANGE)
+            bg = QColor(ACCENT)
             bg.setAlpha(28)
-            border = QColor(ORANGE)
-            icon_color = QColor(ORANGE)
+            border = QColor(ACCENT)
+            icon_color = QColor(ACCENT)
         elif self._hovering:
-            bg, border, icon_color = QColor(SURFACE), QColor(ORANGE), QColor(ORANGE)
+            bg, border, icon_color = QColor(SURFACE), QColor(ACCENT), QColor(ACCENT)
         else:
             bg, border, icon_color = QColor(SURFACE), QColor(BORDER), QColor(INK)
 
         painter.setPen(QPen(border, 1))
         painter.setBrush(bg)
-        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 2, 2)
+        painter.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), rect.height() / 2, rect.height() / 2)
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(icon_color)
@@ -1243,6 +1462,34 @@ class TransportButton(QAbstractButton):
             painter.drawPath(arrow)
 
 
+class ElidedLabel(QLabel):
+    """Single-line QLabel that shows "Long title…" instead of growing its
+    parent when the text is wider than the space it's given."""
+
+    def __init__(self, text: str = ""):
+        super().__init__()
+        self._full_text = ""
+        self.setMinimumWidth(10)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._full_text = text or ""
+        self.setToolTip(self._full_text)
+        self._apply()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self):
+        elided = self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, max(10, self.width()))
+        super().setText(elided)
+
+
 class NowPlayingBar(QWidget):
     """Persistent transport bar — a dumb view like every other custom widget
     in this file: no DB/player access of its own, signals out for user
@@ -1262,82 +1509,80 @@ class NowPlayingBar(QWidget):
         self.setObjectName("nowPlayingBar")
         self._seeking = False
 
-        row = QHBoxLayout(self)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(12)
+        # Compact, sidebar-width layout: art + title on top, the scrub bar
+        # with times under it, then transport controls and a small volume
+        # slider. Playback is occasional, so it stays out of the way.
+        col = QVBoxLayout(self)
+        col.setContentsMargins(10, 10, 10, 8)
+        col.setSpacing(6)
 
-        self.art_tile = ChamferedArtTile(size=40, chamfer=8, clickable=False)
-        row.addWidget(self.art_tile)
-
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.art_tile = RoundedArtTile(size=38, radius=8, clickable=False)
+        top.addWidget(self.art_tile)
         meta_col = QVBoxLayout()
-        meta_col.setSpacing(1)
-        self.title_label = QLabel("NOTHING PLAYING")
+        meta_col.setSpacing(0)
+        self.title_label = ElidedLabel("Nothing playing")
         self.title_label.setObjectName("nowPlayingTitle")
-        self.artist_label = QLabel("")
+        self.artist_label = ElidedLabel("")
         self.artist_label.setObjectName("muted")
         meta_col.addWidget(self.title_label)
         meta_col.addWidget(self.artist_label)
-        meta_widget = QWidget()
-        meta_widget.setLayout(meta_col)
-        meta_widget.setFixedWidth(150)
-        row.addWidget(meta_widget)
+        top.addLayout(meta_col, stretch=1)
+        col.addLayout(top)
 
-        # Custom-painted (TransportButton), not Unicode glyphs — media
-        # symbols (▶⏸⏮⏭⇄) render inconsistently across fonts, sometimes as
-        # an outright ugly fallback glyph. Flat vector shapes always match
-        # Direction E exactly, same reasoning as RailButton/LevelGauge.
-        self.shuffle_btn = TransportButton("shuffle", checkable=True)
-        self.shuffle_btn.setToolTip("Shuffle")
-        self.shuffle_btn.toggled.connect(self.shuffleToggled.emit)
-        row.addWidget(self.shuffle_btn)
-
-        self.prev_btn = TransportButton("prev")
-        self.prev_btn.setToolTip("Previous")
-        self.prev_btn.clicked.connect(self.prevClicked.emit)
-        row.addWidget(self.prev_btn)
-
-        self.play_pause_btn = TransportButton("play", size=(36, 26))
-        self.play_pause_btn.setToolTip("Play/Pause")
-        self.play_pause_btn.clicked.connect(self.playPauseClicked.emit)
-        row.addWidget(self.play_pause_btn)
-
-        self.next_btn = TransportButton("next")
-        self.next_btn.setToolTip("Next")
-        self.next_btn.clicked.connect(self.nextClicked.emit)
-        row.addWidget(self.next_btn)
-
+        scrub_row = QHBoxLayout()
+        scrub_row.setSpacing(6)
         self.position_label = QLabel("0:00")
-        self.position_label.setObjectName("muted")
-        row.addWidget(self.position_label)
-
+        self.position_label.setObjectName("tinyMuted")
         self.scrub_slider = QSlider(Qt.Orientation.Horizontal)
         self.scrub_slider.setRange(0, 0)
         self.scrub_slider.sliderPressed.connect(self._on_scrub_pressed)
         self.scrub_slider.sliderReleased.connect(self._on_scrub_released)
         self.scrub_slider.valueChanged.connect(self._on_scrub_value_changed)
-        row.addWidget(self.scrub_slider, stretch=1)
-
         self.duration_label = QLabel("0:00")
-        self.duration_label.setObjectName("muted")
-        row.addWidget(self.duration_label)
+        self.duration_label.setObjectName("tinyMuted")
+        scrub_row.addWidget(self.position_label)
+        scrub_row.addWidget(self.scrub_slider, stretch=1)
+        scrub_row.addWidget(self.duration_label)
+        col.addLayout(scrub_row)
 
+        # Custom-painted (TransportButton), not Unicode glyphs — media
+        # symbols (▶⏸⏮⏭⇄) render inconsistently across fonts.
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        self.shuffle_btn = TransportButton("shuffle", checkable=True, size=(26, 24))
+        self.shuffle_btn.setToolTip("Shuffle")
+        self.shuffle_btn.toggled.connect(self.shuffleToggled.emit)
+        self.prev_btn = TransportButton("prev", size=(26, 24))
+        self.prev_btn.setToolTip("Previous")
+        self.prev_btn.clicked.connect(self.prevClicked.emit)
+        self.play_pause_btn = TransportButton("play", size=(34, 26))
+        self.play_pause_btn.setToolTip("Play/Pause")
+        self.play_pause_btn.clicked.connect(self.playPauseClicked.emit)
+        self.next_btn = TransportButton("next", size=(26, 24))
+        self.next_btn.setToolTip("Next")
+        self.next_btn.clicked.connect(self.nextClicked.emit)
+        for b in (self.shuffle_btn, self.prev_btn, self.play_pause_btn, self.next_btn):
+            controls.addWidget(b)
+        controls.addStretch(1)
         volume_label = QLabel("♪")
-        volume_label.setObjectName("muted")
-        row.addWidget(volume_label)
-
+        volume_label.setObjectName("tinyMuted")
+        controls.addWidget(volume_label)
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(100)
-        self.volume_slider.setFixedWidth(80)
+        self.volume_slider.setFixedWidth(52)
         self.volume_slider.valueChanged.connect(lambda v: self.volumeChanged.emit(v / 100.0))
-        row.addWidget(self.volume_slider)
+        controls.addWidget(self.volume_slider)
+        col.addLayout(controls)
 
         self._set_controls_enabled(False)
 
     # ---- setters (state in) ----
 
     def set_idle(self):
-        self.title_label.setText("NOTHING PLAYING")
+        self.title_label.setText("Nothing playing")
         self.artist_label.setText("")
         self.art_tile.clear_art()
         self.position_label.setText("0:00")

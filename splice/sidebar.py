@@ -1,14 +1,15 @@
-"""Left-hand navigation, split into two independent widgets: a slim
-text-rail ToolRail (Library home + Merge/Split/YouTube/Tags) and a
-full-height PlaylistDeck. Splitting them (rather than one long stacked
-sidebar) is what lets Playlists get its own single-scrollbar column instead
-of a capped, double-scrolling section fighting the tools list for space."""
+"""Left-hand sidebar: the logo, the two main library sections (Songs,
+Audiobooks), small "needs attention" chips for cleanup pages (Duplicates,
+Unsorted, Health), the playlists list, and a slot at the bottom for the
+compact now-playing player. Tools (Merge/Split/YouTube/Tags) deliberately
+don't live here — they're in MainWindow's top bar — so the sidebar stays
+about browsing your music."""
 
-from PyQt6.QtCore import QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPen
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
-    QAbstractButton,
     QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -17,128 +18,61 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .styles import BG, BORDER, MUTED, ORANGE, PIXEL_FONT_FAMILY
-from .widgets import PixelLabel, render_chamfered_pixmap
+from .styles import ACCENT, MUTED
+from .widgets import DisplayLabel, SunsetStripe, render_rounded_pixmap
 
-TOOLS = [("merge", "MERGE"), ("split", "SPLIT"), ("youtube", "YOUTUBE"), ("tags", "TAGS")]
+# (kind, label) for the main browse sections and the cleanup chips — the
+# kind strings are what Sidebar.navigate emits and MainWindow routes on.
+LIBRARY_SECTIONS = [("songs", "Songs"), ("audiobooks", "Audiobooks")]
+ATTENTION_SECTIONS = [("duplicates", "Dupes"), ("unsorted", "Unsorted"), ("health", "Health")]
 
 
-class RailButton(QAbstractButton):
-    """One rail item: a checkable button whose label renders as vertical,
-    rotated text in the bundled Silkscreen pixel font. QSS can't rotate
-    text, so this paints itself directly via QPainter — same custom-paint
-    idiom as LevelGauge/ChamferedFrame in widgets.py. Subclasses
-    QAbstractButton rather than QWidget specifically to get checkable/
-    clicked/setChecked/isChecked for free, so ToolRail's select() logic
-    barely changes."""
+class NavButton(QPushButton):
+    """A checkable sidebar row: label on the left, an optional muted count
+    on the right. Real child QLabels inside a QPushButton (rather than one
+    text string) so the count can be right-aligned and colored separately."""
 
-    def __init__(self, label: str):
+    def __init__(self, text: str, object_name: str = "navItem"):
         super().__init__()
-        self._label = label
-        self._hover = False
+        self.setObjectName(object_name)
         self.setCheckable(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.setSpacing(6)
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("navText")
+        self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("navCount")
+        self.count_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row.addWidget(self.text_label)
+        row.addStretch(1)
+        row.addWidget(self.count_label)
+        # Child labels don't get re-polished when the button's own
+        # :checked state changes, so mirror it onto them as a property the
+        # stylesheet can match on.
+        self.toggled.connect(self._sync_label_state)
+
+    def _sync_label_state(self, checked: bool):
+        for label in (self.text_label, self.count_label):
+            label.setProperty("active", checked)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+    def set_count(self, text: str):
+        self.count_label.setText(text)
+
+    def set_alert(self, alert: bool):
+        self.count_label.setProperty("alert", alert)
+        self.count_label.style().unpolish(self.count_label)
+        self.count_label.style().polish(self.count_label)
 
     def sizeHint(self) -> QSize:
-        return QSize(38, 90)
-
-    def enterEvent(self, event):
-        self._hover = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hover = False
-        self.update()
-        super().leaveEvent(event)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = self.rect()
-
-        if self.isChecked():
-            tint = QColor(ORANGE)
-            tint.setAlpha(28)
-            painter.fillRect(rect, tint)
-            painter.setPen(QPen(QColor(ORANGE), 2))
-            painter.drawLine(rect.left() + 1, rect.top(), rect.left() + 1, rect.bottom())
-        elif self._hover:
-            painter.fillRect(rect, QColor(BG))
-
-        painter.setPen(QPen(QColor(BORDER), 1))
-        painter.drawLine(rect.bottomLeft(), rect.bottomRight())
-
-        color = ORANGE if self.isChecked() else MUTED
-        font = QFont(PIXEL_FONT_FAMILY)
-        font.setPointSize(11)
-        font.setBold(True)
-        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 2)
-        painter.setFont(font)
-        painter.setPen(QColor(color))
-
-        painter.save()
-        painter.translate(rect.center())
-        painter.rotate(90)
-        # After rotating 90°, the painter's local x-axis runs along the
-        # rail's height and local y along its (negative) width — draw into
-        # a rect matching that, centered on the origin.
-        text_rect = QRect(-rect.height() // 2, -rect.width() // 2, rect.height(), rect.width())
-        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self._label)
-        painter.restore()
-
-
-class ToolRail(QWidget):
-    """Emits navigate(kind, None) on Library/Merge/Split/YouTube. The Tags
-    button additionally emits tagsRequested — MainWindow uses that to reset
-    Batch Apply to an empty state before showing it, so opening Tags cold
-    never shows a previous session's leftover data. (Tags is still reachable
-    generically via select("tags") too, for the contextual Fix Tags / Send
-    Segments to Tags entry points, which set up their own state and don't
-    want the reset.)"""
-
-    navigate = pyqtSignal(str, object)
-    tagsRequested = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("toolRail")
-        self.setFixedWidth(38)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self._nav_buttons: dict[str, RailButton] = {}
-
-        self._add_nav_button(layout, "library", "LIBRARY")
-        for kind, label in TOOLS:
-            btn = self._add_nav_button(layout, kind, label)
-            if kind == "tags":
-                btn.clicked.connect(self.tagsRequested.emit)
-
-    def _add_nav_button(self, layout: QVBoxLayout, kind: str, label_text: str) -> RailButton:
-        btn = RailButton(label_text)
-        btn.clicked.connect(lambda: self.select(kind))
-        layout.addWidget(btn)
-        self._nav_buttons[kind] = btn
-        return btn
-
-    def select(self, kind: str):
-        """Programmatic navigation (e.g. Fix Tags, Send Segments to Tags,
-        Merge's "then split") — mirrors a click on the given rail button."""
-        if kind not in self._nav_buttons:
-            return
-        for k, btn in self._nav_buttons.items():
-            btn.setChecked(k == kind)
-        self.navigate.emit(kind, None)
-
-    def deselect_all(self):
-        """Called when a playlist (owned by the separate PlaylistDeck) is
-        selected instead, so a rail button doesn't stay lit for a page
-        that's no longer showing."""
-        for btn in self._nav_buttons.values():
-            btn.setChecked(False)
+        if self.objectName() == "attentionChip":
+            return QSize(self.layout().sizeHint().width(), 26)  # just as wide as "Label N"
+        return QSize(160, 34)
 
 
 class PlaylistDeck(QWidget):
@@ -154,27 +88,23 @@ class PlaylistDeck(QWidget):
     renameRequested = pyqtSignal(int, str)
 
     THUMB_SIZE = 26
-    THUMB_CHAMFER = 6
+    THUMB_RADIUS = 6
 
     def __init__(self):
         super().__init__()
-        self.setObjectName("playlistDeck")
-        self.setFixedWidth(210)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 10, 4, 10)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
         header_row = QHBoxLayout()
-        header = PixelLabel("PLAYLISTS", point_size=12, color=MUTED, letter_spacing=2)
+        header_row.setContentsMargins(12, 0, 4, 0)
+        header = DisplayLabel("Playlists", point_size=11, color=MUTED, letter_spacing=1)
         header_row.addWidget(header)
         header_row.addStretch(1)
         add_btn = QPushButton("+")
-        # No setFixedSize — the app's QPushButton QSS has 7px/16px padding
-        # (32px+ of horizontal space alone), so a fixed 20x20 box leaves no
-        # room for the glyph and it renders as a blank square. Same bug,
-        # same fix, as the sort-direction/transport buttons earlier this
-        # session — let Qt size it from its own sizeHint().
+        add_btn.setObjectName("sidebarAdd")
         add_btn.setToolTip("New playlist")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         add_btn.clicked.connect(self.createRequested.emit)
         header_row.addWidget(add_btn)
         layout.addLayout(header_row)
@@ -182,12 +112,12 @@ class PlaylistDeck(QWidget):
         self.playlist_list = QListWidget()
         self.playlist_list.setObjectName("sidebarList")
         self.playlist_list.setIconSize(QSize(self.THUMB_SIZE, self.THUMB_SIZE))
+        self.playlist_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.playlist_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.playlist_list.itemClicked.connect(self._on_playlist_clicked)
         self.playlist_list.itemChanged.connect(self._on_playlist_renamed)
-        # No fixed/capped height here, deliberately — the list fills whatever
-        # vertical space the deck column has and scrolls on its own past
-        # that. A second, outer scroll region on top of this is exactly the
-        # double-scrollbar bug this widget replaces.
+        # Fills whatever vertical space is left and scrolls on its own —
+        # one scroll region, never nested inside another.
         layout.addWidget(self.playlist_list, stretch=1)
 
     def _on_playlist_clicked(self, item: QListWidgetItem):
@@ -204,18 +134,144 @@ class PlaylistDeck(QWidget):
     def set_playlists(self, playlists: list[tuple[int, str, bytes | None]]):
         """playlists: list of (playlist_id, name, artwork_bytes_or_None), in
         display order."""
+        selected_id = None
+        current = self.playlist_list.currentItem()
+        if current is not None and current.isSelected():
+            selected_id = current.data(Qt.ItemDataRole.UserRole)
         self.playlist_list.blockSignals(True)  # rebuilding the list is not a user rename
         self.playlist_list.clear()
         for playlist_id, name, art_bytes in playlists:
             item = QListWidgetItem(name)
-            item.setIcon(QIcon(render_chamfered_pixmap(art_bytes, self.THUMB_SIZE, self.THUMB_CHAMFER)))
+            item.setIcon(QIcon(render_rounded_pixmap(art_bytes, self.THUMB_SIZE, self.THUMB_RADIUS)))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             item.setData(Qt.ItemDataRole.UserRole, playlist_id)
+            item.setToolTip(name)
             self.playlist_list.addItem(item)
+            if playlist_id == selected_id:
+                item.setSelected(True)
+                self.playlist_list.setCurrentItem(item)
         self.playlist_list.blockSignals(False)
 
+    def select_playlist(self, playlist_id: int):
+        for i in range(self.playlist_list.count()):
+            item = self.playlist_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == playlist_id:
+                self.playlist_list.setCurrentItem(item)
+                return
+
     def clear_selection(self):
-        """Called when a rail button (owned by the separate ToolRail) is
-        selected instead, so no playlist stays highlighted for a page that's
-        no longer showing."""
         self.playlist_list.clearSelection()
+
+
+class Sidebar(QWidget):
+    """navigate(kind, payload): kind is one of the LIBRARY_SECTIONS /
+    ATTENTION_SECTIONS kinds (payload None) or "playlist" (payload
+    (playlist_id, name)). createRequested/renameRequested are forwarded
+    from the embedded PlaylistDeck. Highlighting is driven from outside
+    via select()/clear_nav(), so programmatic navigation (Fix Tags, Back
+    from a series, ...) keeps the sidebar honest too."""
+
+    navigate = pyqtSignal(str, object)
+    createRequested = pyqtSignal()
+    renameRequested = pyqtSignal(int, str)
+
+    WIDTH = 244
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("sidebar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedWidth(self.WIDTH)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 18, 10, 12)
+        layout.setSpacing(2)
+
+        logo_col = QVBoxLayout()
+        logo_col.setContentsMargins(12, 0, 0, 10)
+        logo_col.setSpacing(4)
+        logo_col.addWidget(DisplayLabel("splice", point_size=20, color=ACCENT, letter_spacing=1))
+        logo_col.addWidget(SunsetStripe(width=64, height=4))
+        layout.addLayout(logo_col)
+
+        layout.addWidget(self._section_label("Library"))
+        self._buttons: dict[str, NavButton] = {}
+        for kind, label in LIBRARY_SECTIONS:
+            layout.addWidget(self._make_button(kind, label, "navItem"))
+
+        chips = QHBoxLayout()
+        chips.setContentsMargins(6, 6, 0, 4)
+        chips.setSpacing(4)
+        for kind, label in ATTENTION_SECTIONS:
+            chips.addWidget(self._make_button(kind, label, "attentionChip"))
+        chips.addStretch(1)
+        layout.addLayout(chips)
+
+        layout.addSpacing(10)
+        self.playlist_deck = PlaylistDeck()
+        self.playlist_deck.navigate.connect(self._on_playlist_navigate)
+        self.playlist_deck.createRequested.connect(self.createRequested.emit)
+        self.playlist_deck.renameRequested.connect(self.renameRequested.emit)
+        layout.addWidget(self.playlist_deck, stretch=1)
+
+        self._player_slot = QVBoxLayout()
+        self._player_slot.setContentsMargins(0, 8, 0, 0)
+        layout.addLayout(self._player_slot)
+
+    def _section_label(self, text: str) -> QLabel:
+        label = DisplayLabel(text, point_size=11, color=MUTED, letter_spacing=1)
+        label.setContentsMargins(12, 6, 0, 4)
+        return label
+
+    def _make_button(self, kind: str, label: str, object_name: str) -> NavButton:
+        btn = NavButton(label, object_name)
+        if object_name == "attentionChip":
+            # Chips are compact: just "Label N", no stretch between them.
+            btn.layout().setContentsMargins(8, 0, 8, 0)
+            btn.layout().setSpacing(4)
+            btn.setToolTip({"duplicates": "Tracks that look like duplicates",
+                            "unsorted": "Files with missing or unusable tags",
+                            "health": "Library checkup"}[kind])
+            btn.layout().takeAt(1)  # drop the stretch
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            btn.setFixedHeight(26)
+        btn.clicked.connect(lambda checked=False, k=kind: self._on_button_clicked(k))
+        self._buttons[kind] = btn
+        return btn
+
+    def _on_button_clicked(self, kind: str):
+        self.select(kind)
+        self.navigate.emit(kind, None)
+
+    def _on_playlist_navigate(self, kind: str, payload):
+        self.clear_nav()
+        self.navigate.emit(kind, payload)
+
+    # ---- state in ----
+
+    def set_player(self, widget: QWidget):
+        self._player_slot.addWidget(widget)
+
+    def set_playlists(self, playlists):
+        self.playlist_deck.set_playlists(playlists)
+
+    def set_counts(self, songs: int, audiobooks: int, duplicates: int, unsorted: int):
+        self._buttons["songs"].set_count(f"{songs:,}")
+        self._buttons["audiobooks"].set_count(f"{audiobooks:,}")
+        for kind, n in (("duplicates", duplicates), ("unsorted", unsorted)):
+            btn = self._buttons[kind]
+            btn.set_count(f"{n:,}" if n else "")
+            btn.set_alert(bool(n))
+
+    def select(self, kind: str):
+        """Highlights the given section (and un-highlights any playlist)."""
+        for k, btn in self._buttons.items():
+            btn.setChecked(k == kind)
+        self.playlist_deck.clear_selection()
+
+    def select_playlist(self, playlist_id: int):
+        self.clear_nav()
+        self.playlist_deck.select_playlist(playlist_id)
+
+    def clear_nav(self):
+        for btn in self._buttons.values():
+            btn.setChecked(False)

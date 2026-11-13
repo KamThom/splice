@@ -50,19 +50,183 @@ from .library.series_artwork import (
     find_series_artwork,
     set_series_artwork,
 )
-from .styles import GREEN, MUTED, ORANGE, RED, STAT_AMBER, STAT_BLUE, STAT_PURPLE
+from .styles import GREEN, MUTED, ACCENT, RED, STAT_AMBER, STAT_PURPLE
 from .widgets import (
     AudiobookShelfWidget,
-    ChamferedArtTile,
-    ChamferedFrame,
+    RoundedArtTile,
+    RoundedFrame,
     LevelGauge,
-    PixelLabel,
+    DisplayLabel,
+    TrackColumnHeader,
     TrackListWidget,
     TrackRowDelegate,
-    render_chamfered_pixmap,
+    render_rounded_pixmap,
     render_mosaic_bytes,
 )
 from .workers import sanitize_filename
+
+
+# ---- shared actions: delete, selection bar, right-click menus ----
+
+_TOP_LEVEL_DIRS = {"Music", "Audiobooks", "Playlists"}
+
+
+def _prune_empty_dirs(file_path: Path, library_root: str):
+    """After deleting a file, removes the folders it leaves empty (an
+    artist/album folder, a series folder), walking up but never past the
+    library's own top-level Music/Audiobooks/Playlists folders."""
+    root = Path(library_root).resolve()
+    folder = file_path.parent
+    while True:
+        try:
+            resolved = folder.resolve()
+        except OSError:
+            return
+        if resolved == root or resolved.parent == resolved or folder.name in _TOP_LEVEL_DIRS:
+            return
+        if root not in resolved.parents:
+            return
+        try:
+            folder.rmdir()  # only succeeds if empty
+        except OSError:
+            return
+        folder = folder.parent
+
+
+def delete_library_tracks(parent, library_root: str, tracks: list[tuple[int, str]],
+                          noun: str = "file", question: str | None = None) -> int:
+    """The one delete path every view uses. tracks: (track_id, path) pairs,
+    path relative to library_root (an absolute path works too). Asks for
+    confirmation, deletes each file and its index entry, rewrites any
+    playlists that referenced it, tidies up emptied folders, and reports
+    files another program had locked. Returns how many were deleted, or -1
+    if the user cancelled."""
+    if not tracks:
+        return 0
+    n = len(tracks)
+    plural = noun if n == 1 else f"{noun}s"
+    reply = QMessageBox.question(
+        parent, "Delete from library",
+        (question or f"Delete {n:,} {plural} from your library?")
+        + "\n\nThis removes Splice's copy only. Your original source folders aren't touched. "
+          "It can't be undone.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    if reply != QMessageBox.StandardButton.Yes:
+        return -1
+    conn = libdb.open_db(library_root)
+    affected_playlist_ids = set()
+    failed = []
+    deleted = 0
+    for track_id, rel_path in tracks:
+        path = Path(library_root) / rel_path
+        error = _try_unlink(path)
+        if error:
+            failed.append(path.name)
+            continue  # leave its index entry in place — the file's still really there
+        affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
+        libdb.delete_track(conn, track_id)
+        _prune_empty_dirs(path, library_root)
+        deleted += 1
+    for playlist_id in affected_playlist_ids:
+        row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+        if row:
+            paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
+            write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
+    conn.close()
+    if failed:
+        QMessageBox.warning(
+            parent, "Some files couldn't be deleted",
+            "These are open in another program, so they were left alone. Close whatever has "
+            "them open and try again:\n\n" + "\n".join(failed),
+        )
+    return deleted
+
+
+def delete_audiobook_series(parent, library_root: str, series_name: str) -> int:
+    """Deletes every book in a series plus the series' artwork. Returns the
+    number of books deleted, or -1 if cancelled."""
+    conn = libdb.open_db(library_root)
+    books = libdb.list_tracks_in_series(conn, series_name)
+    conn.close()
+    if not books:
+        return 0
+    count = len(books)
+    deleted = delete_library_tracks(
+        parent, library_root, [(b["id"], b["library_path"]) for b in books], noun="book",
+        question=f"Delete the series \u201c{series_name}\u201d and all {count} of its "
+                 f"{'book' if count == 1 else 'books'}?",
+    )
+    if deleted == count:
+        clear_series_artwork(library_root, series_name)
+    return deleted
+
+
+class SelectionBar(QWidget):
+    """The action row under every track list: "N selected" on the left,
+    then the actions. Follows one or more lists' selections — get_list
+    returns whichever list is currently showing (Songs vs Audiobooks share
+    one bar)."""
+
+    def __init__(self, lists: list, get_list=None, hint: str = "Select items to act on them, or right-click one"):
+        super().__init__()
+        self._get_list = get_list or (lambda: lists[0])
+        self._hint = hint
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("muted")
+        row.addWidget(self.count_label)
+        row.addStretch(1)
+        self._row = row
+        for lw in lists:
+            lw.itemSelectionChanged.connect(self.update_count)
+        self.update_count()
+
+    def add_button(self, text: str, slot, danger: bool = False) -> QPushButton:
+        btn = QPushButton(text)
+        if danger:
+            btn.setObjectName("danger")
+        btn.clicked.connect(lambda checked=False: slot())
+        self._row.addWidget(btn)
+        return btn
+
+    def update_count(self):
+        lw = self._get_list()
+        n = len(lw.selectedItems()) if lw is not None else 0
+        self.count_label.setText(f"{n:,} selected" if n else self._hint)
+
+
+def attach_context_menu(list_widget: QListWidget, build_menu):
+    """Right-click on a row: if that row isn't already part of the
+    selection, select just it (so the menu always acts on what you
+    clicked), then show build_menu(menu) — which fills in the actions."""
+    list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def show(pos):
+        item = list_widget.itemAt(pos)
+        if item is None:
+            return
+        if not item.isSelected():
+            list_widget.clearSelection()
+            item.setSelected(True)
+            list_widget.setCurrentItem(item)
+        menu = QMenu(list_widget)
+        build_menu(menu, item)
+        if not menu.isEmpty():
+            menu.exec(list_widget.viewport().mapToGlobal(pos))
+
+    list_widget.customContextMenuRequested.connect(show)
+
+
+def add_menu_action(menu: QMenu, text: str, slot, danger: bool = False) -> QAction:
+    """`danger` is documentation only for now — QMenu items can't be styled
+    individually, so destructive actions are set apart with a separator."""
+    action = menu.addAction(text)
+    action.triggered.connect(lambda checked=False: slot())
+    return action
 
 
 def choose_multiple_directories(parent, caption: str, start_dir: str) -> list[str]:
@@ -127,7 +291,7 @@ def playlist_mosaic_art(library_root: str, ordered_paths: list[str]) -> bytes | 
     return render_mosaic_bytes(_collect_cover_art(library_root, ordered_paths))
 
 
-def make_track_list() -> TrackListWidget:
+def make_track_list(columns: list | None = None) -> TrackListWidget:
     """Read-only card-style track list, shared by the Library view's Songs
     and Audiobooks tabs. Each row is painted by TrackRowDelegate (title
     bold, artist muted underneath, a playlist-count badge) rather than
@@ -136,7 +300,7 @@ def make_track_list() -> TrackListWidget:
     TrackListWidget (rather than a plain QListWidget) is what lets clicking
     directly on the badge pill emit badgeClicked instead of just selecting
     the row."""
-    list_widget = TrackListWidget()
+    list_widget = TrackListWidget(columns)
     list_widget.setItemDelegate(TrackRowDelegate(list_widget))
     list_widget.setMouseTracking(True)
     list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -154,6 +318,9 @@ def populate_track_list(list_widget: QListWidget, tracks, membership: dict):
             "library_path": t["library_path"],
             "title": t["title"] or Path(t["library_path"]).stem,
             "artist": t["artist"] or "",
+            "album": t["album"] or "",
+            "added": _format_added_date(t["added_at"]) if t["added_at"] else "",
+            "time": _format_length(t["duration_seconds"]),
             "badge": str(count) if count else None,
             "loudness_lufs": t["loudness_lufs"],
             "loudness_true_peak": t["loudness_true_peak"],
@@ -162,7 +329,7 @@ def populate_track_list(list_widget: QListWidget, tracks, membership: dict):
 
 
 def selected_library_paths(list_widget: QListWidget) -> list[str]:
-    """library_path for each selected row — used by "COPY SELECTED..." on
+    """library_path for each selected row — used by "Copy selected…" on
     the Songs/Audiobooks tabs and by PlaylistView."""
     paths = []
     for item in list_widget.selectedItems():
@@ -172,7 +339,18 @@ def selected_library_paths(list_widget: QListWidget) -> list[str]:
     return paths
 
 
-SORT_FIELDS = ["Title", "Artist", "Date Added", "In"]
+SORT_FIELDS = ["Title", "Artist", "Album", "Date Added", "Time", "In"]
+
+# Column layouts for the single-line table rows: (key, header label, width share).
+SONG_COLUMNS = [("title", "Title", 34), ("artist", "Artist", 22), ("album", "Album", 22),
+                ("added", "Added", 12), ("time", "Time", 8)]
+PLAYLIST_COLUMNS = [("pos", "#", 4), ("title", "Title", 38), ("artist", "Artist", 26), ("album", "Album", 24),
+                    ("time", "Time", 8)]
+AUDIOBOOK_COLUMNS = [("title", "Title", 36), ("artist", "Author", 22), ("album", "Series", 22),
+                     ("added", "Added", 12), ("time", "Length", 8)]
+# Column key → sort_tracks() field name.
+COLUMN_SORT_FIELDS = {"title": "Title", "artist": "Artist", "album": "Album",
+                      "added": "Date Added", "time": "Time", "in": "In"}
 
 # Per-track sort keys that don't need anything beyond the row itself. "In"
 # isn't here — it needs the membership-count dict, not just the row, so
@@ -180,7 +358,9 @@ SORT_FIELDS = ["Title", "Artist", "Date Added", "In"]
 _SORT_KEY_FUNCS = {
     "Title": lambda t: (t["title"] or Path(t["library_path"]).stem).lower(),
     "Artist": lambda t: (t["artist"] or "").lower(),
+    "Album": lambda t: (t["album"] or "").lower(),
     "Date Added": lambda t: t["added_at"] or "",
+    "Time": lambda t: t["duration_seconds"] or 0,
 }
 
 
@@ -261,11 +441,11 @@ class LibraryMigrationDialog(QDialog):
         layout.addWidget(self.sources_list)
 
         source_btn_row = QHBoxLayout()
-        add_music_btn = QPushButton("+ ADD MUSIC PLAYLIST FOLDER(S)")
+        add_music_btn = QPushButton("+ Add music playlist folder(s)")
         add_music_btn.clicked.connect(self._add_music_source)
-        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn = QPushButton("Remove selected")
         remove_btn.clicked.connect(self._remove_selected_source)
-        master_btn = QPushButton("SET AS MASTER")
+        master_btn = QPushButton("Set as master")
         master_btn.clicked.connect(self._set_selected_as_master)
         source_btn_row.addWidget(add_music_btn)
         source_btn_row.addWidget(remove_btn)
@@ -275,16 +455,16 @@ class LibraryMigrationDialog(QDialog):
         audiobooks_row = QHBoxLayout()
         self.audiobooks_label = QLabel("Audiobooks folder: (none)")
         self.audiobooks_label.setObjectName("muted")
-        audiobooks_btn = QPushButton("SET AUDIOBOOKS FOLDER")
+        audiobooks_btn = QPushButton("Set audiobooks folder")
         audiobooks_btn.clicked.connect(self._choose_audiobooks_folder)
         audiobooks_row.addWidget(self.audiobooks_label, stretch=1)
         audiobooks_row.addWidget(audiobooks_btn)
         layout.addLayout(audiobooks_row)
 
         action_row = QHBoxLayout()
-        self.scan_btn = QPushButton("SCAN")
+        self.scan_btn = QPushButton("Scan")
         self.scan_btn.clicked.connect(self._run_scan)
-        self.build_btn = QPushButton("BUILD LIBRARY")
+        self.build_btn = QPushButton("Build library")
         self.build_btn.setObjectName("primary")
         self.build_btn.setEnabled(False)
         self.build_btn.clicked.connect(self._run_build)
@@ -296,7 +476,7 @@ class LibraryMigrationDialog(QDialog):
         self.gauge = LevelGauge()
         layout.addWidget(self.gauge)
 
-        self.report_label = QLabel("Scan is read-only — nothing is copied until you click BUILD LIBRARY.")
+        self.report_label = QLabel("Scan is read-only — nothing is copied until you click Build library.")
         self.report_label.setObjectName("muted")
         self.report_label.setWordWrap(True)
         layout.addWidget(self.report_label)
@@ -307,7 +487,7 @@ class LibraryMigrationDialog(QDialog):
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
-        close_btn = QPushButton("CLOSE")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
@@ -381,7 +561,7 @@ class LibraryMigrationDialog(QDialog):
         self._scan_worker.start()
 
     def _on_scan_done(self, report):
-        self.gauge.set_done("SCAN COMPLETE")
+        self.gauge.set_done("Scan complete")
         self.scan_btn.setEnabled(True)
         self.build_btn.setEnabled(report.new_count > 0)
         self.report_label.setText(
@@ -402,7 +582,7 @@ class LibraryMigrationDialog(QDialog):
         self._build_worker.start()
 
     def _on_build_done(self, report):
-        self.gauge.set_done("BUILD COMPLETE")
+        self.gauge.set_done("Build complete")
         self.build_succeeded = True
         self.scan_btn.setEnabled(True)
         text = (
@@ -449,7 +629,7 @@ class ExportDialog(QDialog):
         audiobooks = list_audiobook_entries(library_root)
 
         if playlists:
-            self._add_header("PLAYLISTS")
+            self._add_header("Playlists")
             for p in playlists:
                 item = self._add_checkable(p["name"], ExportItem("playlist", p["id"], p["name"]))
                 if preselected_playlist_id is not None and p["id"] == preselected_playlist_id:
@@ -457,7 +637,7 @@ class ExportDialog(QDialog):
                     title = f"Export — {p['name']}"
 
         if audiobooks:
-            self._add_header("AUDIOBOOKS")
+            self._add_header("Audiobooks")
             for rel_path, name in audiobooks:
                 self._add_checkable(name, ExportItem("audiobook", rel_path, name))
 
@@ -470,7 +650,7 @@ class ExportDialog(QDialog):
         self.dest_edit = QLineEdit()
         self.dest_edit.setReadOnly(True)
         self.dest_edit.setText(str(self.settings.value("export_destination", "") or ""))
-        dest_btn = QPushButton("CHOOSE...")
+        dest_btn = QPushButton("Choose…")
         dest_btn.clicked.connect(self._choose_destination)
         dest_row.addWidget(self.dest_edit, stretch=1)
         dest_row.addWidget(dest_btn)
@@ -484,10 +664,10 @@ class ExportDialog(QDialog):
         layout.addWidget(replace_hint)
 
         action_row = QHBoxLayout()
-        self.export_btn = QPushButton("EXPORT")
+        self.export_btn = QPushButton("Export")
         self.export_btn.setObjectName("primary")
         self.export_btn.clicked.connect(self._run_export)
-        self.cancel_btn = QPushButton("CANCEL")
+        self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel_export)
         action_row.addWidget(self.export_btn)
@@ -509,7 +689,7 @@ class ExportDialog(QDialog):
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
-        close_btn = QPushButton("CLOSE")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
@@ -590,7 +770,7 @@ class ExportDialog(QDialog):
             self._worker.cancel()
 
     def _on_export_done(self, report: ExportReport):
-        self.gauge.set_done("EXPORT COMPLETE")
+        self.gauge.set_done("Export complete")
         self.export_btn.setEnabled(True)
         self.list_widget.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -604,7 +784,7 @@ class ExportDialog(QDialog):
         self.report_label.setText(text)
 
     def _on_export_cancelled(self):
-        self.gauge.set_cancelled("CANCELLED")
+        self.gauge.set_cancelled("Cancelled")
         self.export_btn.setEnabled(True)
         self.list_widget.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -632,14 +812,14 @@ class CopyTracksDialog(QDialog):
         dest_row = QHBoxLayout()
         self.dest_edit = QLineEdit()
         self.dest_edit.setReadOnly(True)
-        dest_btn = QPushButton("CHOOSE...")
+        dest_btn = QPushButton("Choose…")
         dest_btn.clicked.connect(self._choose_destination)
         dest_row.addWidget(self.dest_edit, stretch=1)
         dest_row.addWidget(dest_btn)
         layout.addLayout(dest_row)
 
         action_row = QHBoxLayout()
-        self.copy_btn = QPushButton("COPY")
+        self.copy_btn = QPushButton("Copy")
         self.copy_btn.setObjectName("primary")
         self.copy_btn.clicked.connect(self._run_copy)
         action_row.addWidget(self.copy_btn)
@@ -659,7 +839,7 @@ class CopyTracksDialog(QDialog):
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
-        close_btn = QPushButton("CLOSE")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
@@ -687,7 +867,7 @@ class CopyTracksDialog(QDialog):
         self._worker.start()
 
     def _on_done(self, report: CopyReport):
-        self.gauge.set_done("COPY COMPLETE")
+        self.gauge.set_done("Copy complete")
         self.copy_btn.setEnabled(True)
         text = f"{report.copied_count} copied, {report.failed_count} failed."
         if report.failed_count:
@@ -721,9 +901,9 @@ class AddFilesDialog(QDialog):
         layout.addWidget(self.file_list, stretch=1)
 
         file_btn_row = QHBoxLayout()
-        choose_btn = QPushButton("+ CHOOSE FILES...")
+        choose_btn = QPushButton("+ Choose files…")
         choose_btn.clicked.connect(self._choose_files)
-        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn = QPushButton("Remove selected")
         remove_btn.clicked.connect(self._remove_selected_files)
         file_btn_row.addWidget(choose_btn)
         file_btn_row.addWidget(remove_btn)
@@ -760,7 +940,7 @@ class AddFilesDialog(QDialog):
         layout.addLayout(dest_row)
 
         action_row = QHBoxLayout()
-        self.add_btn = QPushButton("ADD")
+        self.add_btn = QPushButton("Add")
         self.add_btn.setObjectName("primary")
         self.add_btn.clicked.connect(self._run_add)
         action_row.addWidget(self.add_btn)
@@ -780,7 +960,7 @@ class AddFilesDialog(QDialog):
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
-        close_btn = QPushButton("CLOSE")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         close_row.addWidget(close_btn)
         layout.addLayout(close_row)
@@ -852,7 +1032,7 @@ class AddFilesDialog(QDialog):
         self.log_box.appendPlainText(msg)
 
     def _on_add_done(self, added_count: int):
-        self.gauge.set_done("ADD COMPLETE")
+        self.gauge.set_done("Add complete")
         self.add_btn.setEnabled(True)
         self.report_label.setText(f"{added_count} of {self.file_list.count()} file(s) added.")
         if added_count:
@@ -865,6 +1045,17 @@ def _format_duration(seconds) -> str:
         return "—"
     total = int(seconds)
     return f"{total // 60}:{total % 60:02d}"
+
+
+def _format_length(seconds) -> str:
+    """Table "Time"/"Length" cell: M:SS for songs, "18h 26m" once a file
+    runs an hour or more (audiobooks), which M:SS makes unreadable."""
+    if not seconds:
+        return ""
+    total = int(seconds)
+    if total >= 3600:
+        return f"{total // 3600}h {(total % 3600) // 60:02d}m"
+    return _format_duration(total)
 
 
 def _parse_book_number(tracknumber) -> int | None:
@@ -954,16 +1145,16 @@ class ResolveDuplicateDialog(QDialog):
         layout.addLayout(columns)
 
         cancel_row = QHBoxLayout()
-        dismiss_btn = QPushButton("NOT A DUPLICATE")
+        dismiss_btn = QPushButton("Not a duplicate")
         dismiss_btn.setToolTip("Keep both copies and stop flagging this pair")
         dismiss_btn.clicked.connect(lambda: self._finish("dismiss"))
         cancel_row.addWidget(dismiss_btn)
-        skip_btn = QPushButton("SKIP")
+        skip_btn = QPushButton("Skip")
         skip_btn.setToolTip("Leave this pair for later and go to the next one")
         skip_btn.clicked.connect(lambda: self._finish("skip"))
         cancel_row.addWidget(skip_btn)
         cancel_row.addStretch(1)
-        cancel_btn = QPushButton("STOP")
+        cancel_btn = QPushButton("Stop")
         cancel_btn.clicked.connect(self.reject)
         cancel_row.addWidget(cancel_btn)
         layout.addLayout(cancel_row)
@@ -983,7 +1174,7 @@ class ResolveDuplicateDialog(QDialog):
             label.setWordWrap(True)
             col.addWidget(label)
         col.addStretch(1)
-        keep_btn = QPushButton("KEEP THIS ONE")
+        keep_btn = QPushButton("Keep this one")
         keep_btn.setObjectName("primary")
         keep_btn.clicked.connect(lambda: self._choose(track["id"], other_track_id))
         col.addWidget(keep_btn)
@@ -1099,7 +1290,7 @@ class AutoResolveDialog(QDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        cancel_btn = QPushButton("CANCEL")
+        cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         buttons.addWidget(cancel_btn)
         self.go_btn = QPushButton()
@@ -1121,7 +1312,7 @@ class AutoResolveDialog(QDialog):
                 f"   DELETE   {remove['library_path']}  ({entry['remove_size'] / (1024 * 1024):.1f} MB)"
             )
         self.summary.setText(f"{len(self.plan)} pair(s) will be resolved · {left} left for manual review")
-        self.go_btn.setText(f"RESOLVE {len(self.plan)} PAIR(S)")
+        self.go_btn.setText(f"Resolve {len(self.plan)} pair(s)")
         self.go_btn.setEnabled(bool(self.plan))
 
     def done(self, result: int):
@@ -1173,7 +1364,7 @@ class TrackInfoDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        header_title = QLabel("TRACK INFO")
+        header_title = QLabel("Track info")
         header_title.setObjectName("panelTitle")
         layout.addWidget(header_title)
 
@@ -1185,10 +1376,10 @@ class TrackInfoDialog(QDialog):
 
         footer = QHBoxLayout()
         footer.addStretch(1)
-        edit_btn = QPushButton("EDIT TAGS")
+        edit_btn = QPushButton("Edit tags")
         edit_btn.clicked.connect(self._request_edit_tags)
         footer.addWidget(edit_btn)
-        close_btn = QPushButton("CLOSE")
+        close_btn = QPushButton("Close")
         close_btn.setObjectName("primary")
         close_btn.clicked.connect(self.accept)
         footer.addWidget(close_btn)
@@ -1196,12 +1387,12 @@ class TrackInfoDialog(QDialog):
 
     def _build_left_pane(self, row, full_path: Path, art_bytes: bytes | None) -> QVBoxLayout:
         col = QVBoxLayout()
-        art = ChamferedArtTile(size=168, chamfer=16, clickable=False)
+        art = RoundedArtTile(size=168, radius=16, clickable=False)
         art.set_art(art_bytes)
         col.addWidget(art)
-        col.addLayout(self._field("DURATION", _format_duration(row["duration_seconds"])))
-        col.addLayout(self._field("FILE SIZE", _format_filesize(full_path)))
-        col.addLayout(self._field("ADDED", _format_added_date(row["added_at"])))
+        col.addLayout(self._field("Duration", _format_duration(row["duration_seconds"])))
+        col.addLayout(self._field("File size", _format_filesize(full_path)))
+        col.addLayout(self._field("Added", _format_added_date(row["added_at"])))
         col.addStretch(1)
         return col
 
@@ -1220,7 +1411,7 @@ class TrackInfoDialog(QDialog):
         title_col.addWidget(artist_label)
         heading_row.addLayout(title_col, stretch=1)
         if kind == "music" and not art_bytes:
-            heading_row.addWidget(PixelLabel("MISSING ART", point_size=8, color=RED, letter_spacing=1))
+            heading_row.addWidget(DisplayLabel("Missing art", point_size=8, color=RED, letter_spacing=1))
         col.addLayout(heading_row)
 
         rule1 = QFrame()
@@ -1228,22 +1419,22 @@ class TrackInfoDialog(QDialog):
         col.addWidget(rule1)
 
         row1 = QHBoxLayout()
-        row1.addLayout(self._field("ALBUM", row["album"] or "—"))
-        row1.addLayout(self._field("DATE", row["date"] or "—"))
+        row1.addLayout(self._field("Album", row["album"] or "—"))
+        row1.addLayout(self._field("Date", row["date"] or "—"))
         col.addLayout(row1)
 
         row2 = QHBoxLayout()
         row2.addLayout(self._field("TRACK #", row["tracknumber"] or "—"))
-        row2.addLayout(self._field("LOUDNESS", self._loudness_text(row, kind)))
+        row2.addLayout(self._field("Loudness", self._loudness_text(row, kind)))
         col.addLayout(row2)
 
-        col.addLayout(self._field("LIBRARY PATH", row["library_path"], muted_value=True))
+        col.addLayout(self._field("Library path", row["library_path"], muted_value=True))
 
         rule2 = QFrame()
         rule2.setObjectName("rule")
         col.addWidget(rule2)
 
-        col.addWidget(PixelLabel("IN PLAYLISTS", point_size=8, color=MUTED, letter_spacing=1))
+        col.addWidget(DisplayLabel("In playlists", point_size=8, color=MUTED, letter_spacing=1))
         col.addLayout(self._build_playlist_chips(playlist_rows))
 
         col.addStretch(1)
@@ -1260,7 +1451,7 @@ class TrackInfoDialog(QDialog):
     def _field(self, label_text: str, value_text: str, muted_value: bool = False) -> QVBoxLayout:
         col = QVBoxLayout()
         col.setSpacing(2)
-        col.addWidget(PixelLabel(label_text, point_size=8, color=MUTED, letter_spacing=1))
+        col.addWidget(DisplayLabel(label_text, point_size=8, color=MUTED, letter_spacing=1))
         value = QLabel(value_text)
         value.setWordWrap(True)
         if muted_value:
@@ -1279,7 +1470,7 @@ class TrackInfoDialog(QDialog):
         for p in playlist_rows:
             chip = QLabel(p["name"])
             chip.setStyleSheet(
-                f"border: 1px solid {ORANGE}; color: {ORANGE}; border-radius: 9px; padding: 3px 10px;"
+                f"border: 1px solid {ACCENT}; color: {ACCENT}; border-radius: 9px; padding: 3px 10px;"
             )
             row.addWidget(chip)
         row.addStretch(1)
@@ -1302,6 +1493,10 @@ class LibraryView(QWidget):
     playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path), start index — double-clicked a song
     healthRescanRequested = pyqtSignal()  # HEALTH tab's RESCAN button — nudges MainWindow's background art-check worker
     audiobookSeriesActivated = pyqtSignal(str)  # series (Album tag) name — a shelf series tile was clicked
+    countsChanged = pyqtSignal(int, int, int, int)  # songs, audiobooks, duplicate pairs, unsorted — sidebar counts/badges
+    headerChanged = pyqtSignal(str, str)  # page title, one-line summary — MainWindow's top bar shows these
+
+    SECTIONS = ["songs", "audiobooks", "duplicates", "unsorted", "health"]  # sub_tabs index order
 
     def __init__(self, get_library_root, set_library_root):
         super().__init__()
@@ -1315,137 +1510,118 @@ class LibraryView(QWidget):
         self._search_debounce.setInterval(200)
         self._search_debounce.timeout.connect(self.refresh)
 
+        self._counts = {"songs": 0, "audiobooks": 0, "duplicates": 0, "unsorted": 0,
+                        "playtime": "", "series": 0}
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        title = QLabel("LIBRARY")
-        title.setObjectName("panelTitle")
-        layout.addWidget(title)
-
-        self.location_btn = QPushButton()
-        self.location_btn.setObjectName("outputBar")
-        self.location_btn.clicked.connect(self._change_library_location)
-        layout.addWidget(self.location_btn)
-        self._refresh_location_label()
-
-        stats_row = QHBoxLayout()
-        stats_row.setSpacing(10)
-        self.stat_songs_value = QLabel("0")
-        self.stat_audiobooks_value = QLabel("0")
-        self.stat_playlists_value = QLabel("0")
-        self.stat_playtime_value = QLabel("0m")
-        self.stat_artists_value = QLabel("0")
-        stats_row.addWidget(self._make_stat_card("SONGS", self.stat_songs_value, STAT_BLUE))
-        stats_row.addWidget(self._make_stat_card("AUDIOBOOKS", self.stat_audiobooks_value, STAT_PURPLE))
-        stats_row.addWidget(self._make_stat_card("PLAYLISTS", self.stat_playlists_value, GREEN))
-        stats_row.addWidget(self._make_stat_card("PLAYTIME", self.stat_playtime_value, STAT_AMBER))
-        stats_row.addWidget(self._make_stat_card("ARTISTS", self.stat_artists_value, ORANGE))
-        layout.addLayout(stats_row)
-
-        top_row = QHBoxLayout()
+        self.search_row = QWidget()
+        top_row = QHBoxLayout(self.search_row)
+        top_row.setContentsMargins(0, 0, 0, 0)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search title, artist, album...")
+        self.search_edit.setPlaceholderText("Search title, artist, album")
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(lambda: self._search_debounce.start())
         top_row.addWidget(self.search_edit, stretch=1)
+        layout.addWidget(self.search_row)
 
-        settings_btn = QPushButton("⚙")
-        settings_btn.setToolTip("Library settings")
-        settings_menu = QMenu(self)
-        add_sources_action = QAction("ADD SOURCES...", self)
+        # Library-wide actions live in a ⋯ menu that MainWindow puts in its
+        # top bar (see library_menu) — including the library folder, which
+        # used to take up a full-width bar of its own.
+        self.library_menu = QMenu(self)
+        add_sources_action = QAction("Add sources…", self)
         add_sources_action.triggered.connect(self._open_migration_dialog)
-        add_files_action = QAction("ADD FILES...", self)
+        add_files_action = QAction("Add files…", self)
         add_files_action.triggered.connect(self._open_add_files_dialog)
-        export_action = QAction("EXPORT...", self)
+        export_action = QAction("Export…", self)
         export_action.triggered.connect(self._open_export_dialog)
-        settings_menu.addAction(add_sources_action)
-        settings_menu.addAction(add_files_action)
-        settings_menu.addAction(export_action)
-        settings_btn.setMenu(settings_menu)
-        top_row.addWidget(settings_btn)
-        layout.addLayout(top_row)
+        self.library_menu.addAction(add_sources_action)
+        self.library_menu.addAction(add_files_action)
+        self.library_menu.addAction(export_action)
+        self.library_menu.addSeparator()
+        self.location_action = QAction("", self)
+        self.location_action.setEnabled(False)
+        self.library_menu.addAction(self.location_action)
+        change_location_action = QAction("Change library folder…", self)
+        change_location_action.triggered.connect(self._change_library_location)
+        self.library_menu.addAction(change_location_action)
+        self._refresh_location_label()
 
-        self.sort_actions = QWidget()
-        sort_row = QHBoxLayout(self.sort_actions)
-        sort_row.setContentsMargins(0, 0, 0, 0)
-        sort_label = QLabel("SORT:")
-        sort_label.setObjectName("muted")
-        sort_row.addWidget(sort_label)
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems(SORT_FIELDS)
-        self.sort_combo.currentTextChanged.connect(self._on_sort_changed)
-        sort_row.addWidget(self.sort_combo)
-        self.sort_direction_btn = QPushButton("▲")
-        self.sort_direction_btn.setToolTip("Toggle ascending/descending")
-        self.sort_direction_btn.clicked.connect(self._toggle_sort_direction)
-        sort_row.addWidget(self.sort_direction_btn)
-        sort_row.addStretch(1)
-        layout.addWidget(self.sort_actions)
-
+        # Sections are switched from the sidebar, so the tab bar itself is
+        # hidden — the QTabWidget is kept (rather than a QStackedWidget) only
+        # because plenty of code already talks to it by index.
         self.sub_tabs = QTabWidget()
-        self.songs_list = make_track_list()
-        self.audiobooks_list = make_track_list()
+        self.sub_tabs.setObjectName("sectionStack")
+        self.sub_tabs.setDocumentMode(True)
+        self.sub_tabs.tabBar().hide()
+        self.songs_list = make_track_list(SONG_COLUMNS)
+        self.audiobooks_list = make_track_list(AUDIOBOOK_COLUMNS)
         self.songs_list.badgeClicked.connect(self._show_playlist_membership_menu)
         self.audiobooks_list.badgeClicked.connect(self._show_playlist_membership_menu)
         self.songs_list.infoClicked.connect(self._show_track_info_by_id)
         self.audiobooks_list.infoClicked.connect(self._show_track_info_by_id)
         self.songs_list.itemDoubleClicked.connect(self._play_from_songs)  # music only — never audiobooks_list
+        self.songs_list.enable_file_drag(self._get_library_root)
+        self.audiobooks_list.enable_file_drag(self._get_library_root)
         self.duplicates_list = QListWidget()
         self.unsorted_list = QListWidget()
         self.unsorted_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
-        self.sub_tabs.addTab(self.songs_list, "SONGS")
-        self.sub_tabs.addTab(self._build_audiobooks_tab(), "AUDIOBOOKS")
-        self.sub_tabs.addTab(self.duplicates_list, "DUPLICATES")
-        self.sub_tabs.addTab(self.unsorted_list, "UNSORTED")
-        self.sub_tabs.addTab(self._build_health_tab(), "HEALTH")
+        sortable = set(COLUMN_SORT_FIELDS)
+        self.songs_header = TrackColumnHeader(self.songs_list, sortable)
+        self.songs_header.sortRequested.connect(self._on_column_sort)
+        self.audiobooks_header = TrackColumnHeader(self.audiobooks_list, sortable)
+        self.audiobooks_header.sortRequested.connect(self._on_column_sort)
+        self._sync_sort_headers()
+
+        self.sub_tabs.addTab(self._with_header(self.songs_header, self.songs_list), "Songs")
+        self.sub_tabs.addTab(self._build_audiobooks_tab(), "Audiobooks")
+        self.sub_tabs.addTab(self.duplicates_list, "Duplicates")
+        self.sub_tabs.addTab(self.unsorted_list, "Unsorted")
+        self.sub_tabs.addTab(self._build_health_tab(), "Health")
         layout.addWidget(self.sub_tabs, stretch=1)
 
-        self.copy_actions = QWidget()
-        copy_row = QHBoxLayout(self.copy_actions)
-        copy_row.setContentsMargins(0, 0, 0, 0)
-        copy_row.addStretch(1)
-        edit_tags_btn = QPushButton("EDIT TAGS")
-        edit_tags_btn.clicked.connect(self._edit_tags_selected_track)
-        copy_row.addWidget(edit_tags_btn)
-        remove_selected_btn = QPushButton("REMOVE SELECTED")
-        remove_selected_btn.clicked.connect(self._remove_selected_tracks)
-        copy_row.addWidget(remove_selected_btn)
-        copy_selected_btn = QPushButton("COPY SELECTED...")
-        copy_selected_btn.clicked.connect(self._copy_selected_tracks)
-        copy_row.addWidget(copy_selected_btn)
-        self.add_to_playlist_btn = QPushButton("ADD TO PLAYLIST...")
-        self.add_to_playlist_btn.clicked.connect(self._add_selected_to_playlist)
-        copy_row.addWidget(self.add_to_playlist_btn)
+        # One bar for Songs and Audiobooks-All — whichever list is showing.
+        self.copy_actions = SelectionBar([self.songs_list, self.audiobooks_list], get_list=self._active_track_list)
+        self.add_to_playlist_btn = self.copy_actions.add_button("Add to playlist…", self._add_selected_to_playlist)
+        self.copy_actions.add_button("Edit tags", self._edit_tags_selected_track)
+        self.copy_actions.add_button("Copy…", self._copy_selected_tracks)
+        self.copy_actions.add_button("Delete…", self._remove_selected_tracks, danger=True)
         layout.addWidget(self.copy_actions)
+        attach_context_menu(self.songs_list, self._build_track_menu)
+        attach_context_menu(self.audiobooks_list, self._build_track_menu)
 
         self.dupe_actions = QWidget()
         dupe_row = QHBoxLayout(self.dupe_actions)
         dupe_row.setContentsMargins(0, 0, 0, 0)
         dupe_row.addStretch(1)
-        auto_resolve_btn = QPushButton("AUTO-RESOLVE...")
+        auto_resolve_btn = QPushButton("Auto-resolve…")
         auto_resolve_btn.setToolTip("Keep the larger copy of every pair with matching title/artist")
         auto_resolve_btn.clicked.connect(self._auto_resolve_dupes)
         dupe_row.addWidget(auto_resolve_btn)
-        resolve_btn = QPushButton("RESOLVE...")
+        resolve_btn = QPushButton("Resolve…")
         resolve_btn.clicked.connect(self._resolve_selected_dupe)
         dupe_row.addWidget(resolve_btn)
-        dismiss_btn = QPushButton("DISMISS SELECTED")
+        dismiss_btn = QPushButton("Dismiss selected")
         dismiss_btn.clicked.connect(self._dismiss_selected_dupe)
         dupe_row.addWidget(dismiss_btn)
         layout.addWidget(self.dupe_actions)
 
-        self.unsorted_actions = QWidget()
-        unsorted_row = QHBoxLayout(self.unsorted_actions)
-        unsorted_row.setContentsMargins(0, 0, 0, 0)
-        unsorted_row.addStretch(1)
-        fix_tags_btn = QPushButton("FIX TAGS")
-        fix_tags_btn.clicked.connect(self._fix_selected_unsorted_tags)
-        unsorted_row.addWidget(fix_tags_btn)
-        remove_unsorted_btn = QPushButton("REMOVE SELECTED")
-        remove_unsorted_btn.clicked.connect(self._remove_selected_unsorted)
-        unsorted_row.addWidget(remove_unsorted_btn)
+        self.unsorted_actions = SelectionBar(
+            [self.unsorted_list], hint="Select a file and fix its tags to file it into your library"
+        )
+        self.unsorted_actions.add_button("Fix tags", self._fix_selected_unsorted_tags)
+        self.unsorted_actions.add_button("Delete…", self._remove_selected_unsorted, danger=True)
         layout.addWidget(self.unsorted_actions)
+
+        def unsorted_menu(menu, item):
+            if len(self.unsorted_list.selectedItems()) == 1:
+                add_menu_action(menu, "Fix tags", self._fix_selected_unsorted_tags)
+                menu.addSeparator()
+            add_menu_action(menu, "Delete…", self._remove_selected_unsorted, danger=True)
+        attach_context_menu(self.unsorted_list, unsorted_menu)
 
         self.sub_tabs.currentChanged.connect(self._update_sub_tab_actions)
         self._update_sub_tab_actions(self.sub_tabs.currentIndex())
@@ -1457,15 +1633,72 @@ class LibraryView(QWidget):
 
         self.refresh()
 
-    def _make_stat_card(self, label_text: str, value_label: QLabel, value_color: str) -> ChamferedFrame:
-        frame = ChamferedFrame(chamfer=12)
+    @staticmethod
+    def _with_header(header: QWidget, body: QWidget) -> QWidget:
+        page = QWidget()
+        col = QVBoxLayout(page)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(2)
+        col.addWidget(header)
+        col.addWidget(body, stretch=1)
+        return page
+
+    def show_section(self, kind: str):
+        """Switch to one of SECTIONS — driven by the sidebar."""
+        if kind in self.SECTIONS:
+            self.sub_tabs.setCurrentIndex(self.SECTIONS.index(kind))
+
+    def current_section(self) -> str:
+        return self.SECTIONS[self.sub_tabs.currentIndex()]
+
+    def _section_header(self) -> tuple[str, str]:
+        c = self._counts
+        kind = self.current_section()
+        if kind == "songs":
+            summary = f"{c['songs']:,} songs" + (f" · {c['playtime']}" if c["playtime"] else "")
+        elif kind == "audiobooks":
+            summary = f"{c['audiobooks']:,} files"
+            if c["series"]:
+                summary += f" · {c['series']} series"
+        elif kind == "duplicates":
+            summary = (f"{c['duplicates']:,} pairs that look like the same track"
+                       if c["duplicates"] else "Nothing to review")
+        elif kind == "unsorted":
+            summary = (f"{c['unsorted']:,} files with missing or unusable tags"
+                       if c["unsorted"] else "Everything's filed")
+        else:
+            summary = "Missing tags, art, and files that have drifted out of sync"
+        return self.sub_tabs.tabText(self.sub_tabs.currentIndex()), summary
+
+    def _emit_header(self):
+        self.headerChanged.emit(*self._section_header())
+
+    def _on_column_sort(self, key: str):
+        field = COLUMN_SORT_FIELDS.get(key, "Title")
+        if field == self._sort_field:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_field = field
+            # Newest first / longest first / most playlists first is the
+            # useful starting direction for those; A→Z for text columns.
+            self._sort_ascending = field not in ("Date Added", "Time", "In")
+        self._sync_sort_headers()
+        self.refresh()
+
+    def _sync_sort_headers(self):
+        key = next((k for k, f in COLUMN_SORT_FIELDS.items() if f == self._sort_field), "title")
+        self.songs_header.set_sort(key, self._sort_ascending)
+        self.audiobooks_header.set_sort(key, self._sort_ascending)
+
+    def _make_stat_card(self, label_text: str, value_label: QLabel, value_color: str) -> RoundedFrame:
+        frame = RoundedFrame(radius=12)
         inner = QVBoxLayout(frame)
         inner.setContentsMargins(14, 12, 14, 12)
         inner.setSpacing(8)
         # Label stays a uniform muted pixel caption — the color goes on the
         # number itself instead, one distinct accent per card, so they're
         # tellable apart at a glance without turning the labels into noise.
-        inner.addWidget(PixelLabel(label_text, point_size=12, color=MUTED, letter_spacing=2))
+        inner.addWidget(DisplayLabel(label_text, point_size=12, color=MUTED, letter_spacing=2))
         value_label.setStyleSheet(f"font-size: 22px; font-weight: bold; color: {value_color};")
         inner.addWidget(value_label)
         return frame
@@ -1483,11 +1716,11 @@ class LibraryView(QWidget):
         layout.setSpacing(8)
 
         toggle_row = QHBoxLayout()
-        view_label = QLabel("VIEW:")
+        view_label = QLabel("View")
         view_label.setObjectName("muted")
         toggle_row.addWidget(view_label)
         self.audiobooks_view_toggle = QComboBox()
-        self.audiobooks_view_toggle.addItems(["SERIES", "ALL"])
+        self.audiobooks_view_toggle.addItems(["Series", "All"])
         self.audiobooks_view_toggle.currentTextChanged.connect(self._on_audiobooks_view_changed)
         toggle_row.addWidget(self.audiobooks_view_toggle)
         toggle_row.addStretch(1)
@@ -1498,36 +1731,28 @@ class LibraryView(QWidget):
         self.audiobooks_shelf.seriesActivated.connect(self.audiobookSeriesActivated.emit)
         self.audiobooks_shelf.playRequested.connect(self.playRequested.emit)
         self.audiobooks_shelf.infoRequested.connect(self._show_track_info_by_id)
+        self.audiobooks_shelf.seriesMenuRequested.connect(self._show_series_tile_menu)
+        self.audiobooks_shelf.bookMenuRequested.connect(self._show_book_tile_menu)
         self.audiobooks_stack.addWidget(self.audiobooks_shelf)
-        self.audiobooks_stack.addWidget(self.audiobooks_list)
+        self.audiobooks_stack.addWidget(self._with_header(self.audiobooks_header, self.audiobooks_list))
         layout.addWidget(self.audiobooks_stack, stretch=1)
 
         return tab
 
     def _on_audiobooks_view_changed(self, text: str):
-        self.audiobooks_stack.setCurrentWidget(
-            self.audiobooks_list if text == "ALL" else self.audiobooks_shelf
-        )
+        self.audiobooks_stack.setCurrentIndex(1 if text == "All" else 0)
         self._update_sub_tab_actions(self.sub_tabs.currentIndex())
 
     def _update_sub_tab_actions(self, index: int):
-        audiobooks_all = index == 1 and self.audiobooks_view_toggle.currentText() == "ALL"
-        self.sort_actions.setVisible(index == 0 or audiobooks_all)
+        audiobooks_all = index == 1 and self.audiobooks_view_toggle.currentText() == "All"
+        self.search_row.setVisible(index in (0, 1))
         self.copy_actions.setVisible(index == 0 or audiobooks_all)
         self.add_to_playlist_btn.setVisible(index == 0)  # SONGS only — playlists are a music-only concept
         self.dupe_actions.setVisible(index == 2)  # DUPLICATES
         self.unsorted_actions.setVisible(index == 3)  # UNSORTED
         if index == HEALTH_TAB_INDEX:
             self._refresh_health()
-
-    def _on_sort_changed(self, field: str):
-        self._sort_field = field
-        self.refresh()
-
-    def _toggle_sort_direction(self):
-        self._sort_ascending = not self._sort_ascending
-        self.sort_direction_btn.setText("▲" if self._sort_ascending else "▼")
-        self.refresh()
+        self._emit_header()
 
     # ---- data loading ----
 
@@ -1576,10 +1801,7 @@ class LibraryView(QWidget):
 
     def _refresh_location_label(self):
         root = self._get_library_root()
-        if root:
-            self.location_btn.setText(f"LIBRARY ▸  {root}   (click to change)")
-        else:
-            self.location_btn.setText("LIBRARY ▸  (no location chosen yet)   (click to change)")
+        self.location_action.setText(f"Library folder: {root}" if root else "Library folder: not chosen yet")
 
     def _change_library_location(self):
         current = self._get_library_root()
@@ -1596,7 +1818,9 @@ class LibraryView(QWidget):
         library_root = self._get_library_root()
         if not library_root or not Path(library_root).exists():
             self._clear_all()
-            self.empty_hint.setText("No library yet — click ADD SOURCES to get started.")
+            self.empty_hint.setText("No library yet. Open the ⋯ menu and choose Add sources to get started.")
+            self.countsChanged.emit(0, 0, 0, 0)
+            self._emit_header()
             self.libraryChanged.emit()
             return
 
@@ -1619,16 +1843,19 @@ class LibraryView(QWidget):
         self._populate_dupes(conn, dupes)
         self._refresh_audiobook_shelf(conn, library_root)
 
-        self.sub_tabs.setTabText(3, f"UNSORTED ({len(unsorted_tracks)})")
         self.empty_hint.setText(
-            "" if (music_tracks or audiobook_tracks) else "No library yet — click ADD SOURCES to get started."
+            "" if (music_tracks or audiobook_tracks) else "No library yet. Open the ⋯ menu and choose Add sources to get started."
         )
-        self.stat_songs_value.setText(str(len(music_tracks)))
-        self.stat_audiobooks_value.setText(str(len(audiobook_tracks)))
-        self.stat_playlists_value.setText(str(len(libdb.list_playlists(conn))))
-        self.stat_playtime_value.setText(_format_total_playtime(libdb.music_total_duration_seconds(conn)))
-        self.stat_artists_value.setText(str(libdb.music_unique_artist_count(conn)))
+        self._counts.update(
+            songs=len(music_tracks), audiobooks=len(audiobook_tracks), duplicates=self.duplicates_list.count(),
+            unsorted=len(unsorted_tracks),
+            playtime=_format_total_playtime(libdb.music_total_duration_seconds(conn)),
+            series=len({(t["album"] or "").strip() for t in audiobook_tracks if (t["album"] or "").strip()}),
+        )
         conn.close()
+        self.countsChanged.emit(self._counts["songs"], self._counts["audiobooks"],
+                                self._counts["duplicates"], self._counts["unsorted"])
+        self._emit_header()
         self.libraryChanged.emit()
 
     def _filter(self, tracks, query: str):
@@ -1706,12 +1933,7 @@ class LibraryView(QWidget):
         self.audiobooks_shelf.populate([], [])
         self.duplicates_list.clear()
         self.unsorted_list.clear()
-        self.sub_tabs.setTabText(3, "UNSORTED (0)")
-        self.stat_songs_value.setText("0")
-        self.stat_audiobooks_value.setText("0")
-        self.stat_playlists_value.setText("0")
-        self.stat_playtime_value.setText("0m")
-        self.stat_artists_value.setText("0")
+        self._counts.update(songs=0, audiobooks=0, duplicates=0, unsorted=0, playtime="", series=0)
 
     # ---- actions ----
 
@@ -1813,51 +2035,71 @@ class LibraryView(QWidget):
         self.songs_list.set_playing_track(track_id)
         self.audiobooks_list.set_playing_track(track_id)  # picks up an audiobook played from the shelf/series view
 
+    def _active_track_list(self):
+        return self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
+
+    def _build_track_menu(self, menu: QMenu, item: QListWidgetItem):
+        """Right-click menu for a Songs / Audiobooks-All row."""
+        is_songs = self.sub_tabs.currentIndex() == 0
+        single = len(self._active_track_list().selectedItems()) == 1
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        if is_songs and single:
+            add_menu_action(menu, "Play", lambda: self._play_from_songs(item))
+        if is_songs:
+            add_menu_action(menu, "Add to playlist…", self._add_selected_to_playlist)
+        if single:
+            add_menu_action(menu, "Edit tags", self._edit_tags_selected_track)
+            add_menu_action(menu, "Track info", lambda: self._show_track_info_by_id(data["id"]))
+        add_menu_action(menu, "Copy…", self._copy_selected_tracks)
+        menu.addSeparator()
+        add_menu_action(menu, "Delete…", self._remove_selected_tracks, danger=True)
+
+    def _show_series_tile_menu(self, series_name: str, pos):
+        menu = QMenu(self)
+        add_menu_action(menu, "Open", lambda: self.audiobookSeriesActivated.emit(series_name))
+        menu.addSeparator()
+        add_menu_action(menu, "Delete series…", lambda: self._delete_series(series_name), danger=True)
+        menu.exec(pos)
+
+    def _delete_series(self, series_name: str):
+        library_root = self._get_library_root()
+        if library_root and delete_audiobook_series(self, library_root, series_name) > 0:
+            self.refresh()
+
+    def _show_book_tile_menu(self, entry: dict, pos):
+        """⋯ / right-click on a standalone (no-series) audiobook tile."""
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        rel_path = str(Path(entry["path"]).relative_to(library_root))
+        menu = QMenu(self)
+        add_menu_action(menu, "Play", lambda: self.playRequested.emit(
+            [{k: v for k, v in entry.items() if k != "art"}], 0))
+        add_menu_action(menu, "Track info", lambda: self._show_track_info_by_id(entry["id"]))
+        add_menu_action(menu, "Edit tags", lambda: self.fixTagsRequested.emit(entry["path"], entry["id"]))
+        add_menu_action(menu, "Copy…", lambda: CopyTracksDialog(self, library_root, [rel_path]).exec())
+        menu.addSeparator()
+
+        def delete():
+            if delete_library_tracks(self, library_root, [(entry["id"], rel_path)], noun="audiobook") > 0:
+                self._standalone_audiobook_art_cache.pop(entry["id"], None)
+                self.refresh()
+        add_menu_action(menu, "Delete…", delete, danger=True)
+        menu.exec(pos)
+
     def _remove_selected_tracks(self):
-        active_list = self.songs_list if self.sub_tabs.currentIndex() == 0 else self.audiobooks_list
-        items = active_list.selectedItems()
+        items = self._active_track_list().selectedItems()
         if not items:
             QMessageBox.information(self, "Nothing selected", "Select one or more tracks first.")
             return
         library_root = self._get_library_root()
         if not library_root:
             return
-        reply = QMessageBox.question(
-            self, "Remove from library",
-            f"Permanently delete {len(items)} file(s) from your library? This only removes "
-            f"Splice's own copy — nothing at your original source location is touched.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        conn = libdb.open_db(library_root)
-        affected_playlist_ids = set()
-        failed = []
-        for item in items:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            track_id = data["id"]
-            path = Path(library_root) / data["library_path"]
-            error = _try_unlink(path)
-            if error:
-                failed.append(path.name)
-                continue  # leave its index entry in place — the file's still really there
-            affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
-            libdb.delete_track(conn, track_id)
-        for playlist_id in affected_playlist_ids:
-            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
-            if row:
-                paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
-                write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
-        conn.close()
-        self.refresh()
-        if failed:
-            QMessageBox.warning(
-                self, "Some files couldn't be removed",
-                "These are currently in use by another program, so they weren't removed "
-                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
-                + "\n".join(failed),
-            )
+        is_songs = self.sub_tabs.currentIndex() == 0
+        tracks = [(i.data(Qt.ItemDataRole.UserRole)["id"], i.data(Qt.ItemDataRole.UserRole)["library_path"])
+                  for i in items]
+        if delete_library_tracks(self, library_root, tracks, noun="song" if is_songs else "audiobook") > 0:
+            self.refresh()
 
     def _dismiss_selected_dupe(self):
         item = self.duplicates_list.currentItem()
@@ -2001,42 +2243,10 @@ class LibraryView(QWidget):
         library_root = self._get_library_root()
         if not library_root:
             return
-        reply = QMessageBox.question(
-            self, "Remove from library",
-            f"Permanently delete {len(items)} file(s) from your library? This only removes "
-            f"Splice's own copy — nothing at your original source location is touched.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        conn = libdb.open_db(library_root)
-        affected_playlist_ids = set()
-        failed = []
-        for item in items:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            track_id = data["track_id"]
-            path = Path(data["path"])
-            error = _try_unlink(path)
-            if error:
-                failed.append(path.name)
-                continue  # leave its index entry in place — the file's still really there
-            affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
-            libdb.delete_track(conn, track_id)
-        for playlist_id in affected_playlist_ids:
-            row = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
-            if row:
-                paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
-                write_m3u8(str(Path(library_root) / "Playlists"), row["name"], paths, library_root)
-        conn.close()
-        self.refresh()
-        if failed:
-            QMessageBox.warning(
-                self, "Some files couldn't be removed",
-                "These are currently in use by another program, so they weren't removed "
-                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
-                + "\n".join(failed),
-            )
+        tracks = [(i.data(Qt.ItemDataRole.UserRole)["track_id"], i.data(Qt.ItemDataRole.UserRole)["path"])
+                  for i in items]
+        if delete_library_tracks(self, library_root, tracks) > 0:
+            self.refresh()
 
     # ---- health dashboard ----
 
@@ -2054,7 +2264,7 @@ class LibraryView(QWidget):
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         header_row.addWidget(hint, stretch=1)
-        rescan_btn = QPushButton("RESCAN")
+        rescan_btn = QPushButton("Rescan")
         rescan_btn.clicked.connect(self._health_rescan)
         header_row.addWidget(rescan_btn)
         layout.addLayout(header_row)
@@ -2063,11 +2273,11 @@ class LibraryView(QWidget):
         stats_row.setSpacing(10)
         self.health_stat_values = {}
         for label, color in [
-            ("DUPLICATES", GREEN),
-            ("MISSING TAGS", STAT_AMBER),
-            ("MISSING ART", STAT_PURPLE),
-            ("MISSING FILES", RED),
-            ("ORPHANED FILES", ORANGE),
+            ("Duplicates", GREEN),
+            ("Missing tags", STAT_AMBER),
+            ("Missing art", STAT_PURPLE),
+            ("Missing files", RED),
+            ("Orphaned files", ACCENT),
         ]:
             value_label = QLabel("0")
             self.health_stat_values[label] = value_label
@@ -2075,7 +2285,7 @@ class LibraryView(QWidget):
         layout.addLayout(stats_row)
 
         category_row = QHBoxLayout()
-        category_label = QLabel("SHOW:")
+        category_label = QLabel("Show")
         category_label.setObjectName("muted")
         category_row.addWidget(category_label)
         self.health_category_combo = QComboBox()
@@ -2089,13 +2299,13 @@ class LibraryView(QWidget):
         self.health_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         layout.addWidget(self.health_list, stretch=1)
 
-        self.health_fix_tags_btn = QPushButton("FIX TAGS")
+        self.health_fix_tags_btn = QPushButton("Fix tags")
         self.health_fix_tags_btn.clicked.connect(self._health_fix_tags)
-        self.health_remove_btn = QPushButton("REMOVE FROM INDEX")
+        self.health_remove_btn = QPushButton("Remove from index")
         self.health_remove_btn.clicked.connect(self._health_remove_missing)
-        self.health_adopt_btn = QPushButton("FILE INTO LIBRARY")
+        self.health_adopt_btn = QPushButton("File into library")
         self.health_adopt_btn.clicked.connect(self._health_file_orphans)
-        self.health_goto_dupes_btn = QPushButton("GO TO DUPLICATES")
+        self.health_goto_dupes_btn = QPushButton("Go to duplicates")
         self.health_goto_dupes_btn.clicked.connect(lambda: self.sub_tabs.setCurrentIndex(2))
 
         action_row = QHBoxLayout()
@@ -2183,11 +2393,11 @@ class LibraryView(QWidget):
             "Missing Files": missing_entries,
             "Orphaned Files": orphan_entries,
         }
-        self.health_stat_values["DUPLICATES"].setText(str(len(dupe_entries)))
-        self.health_stat_values["MISSING TAGS"].setText(str(len(tag_entries)))
-        self.health_stat_values["MISSING ART"].setText(str(len(art_entries)))
-        self.health_stat_values["MISSING FILES"].setText(str(len(missing_entries)))
-        self.health_stat_values["ORPHANED FILES"].setText(str(len(orphan_entries)))
+        self.health_stat_values["Duplicates"].setText(str(len(dupe_entries)))
+        self.health_stat_values["Missing tags"].setText(str(len(tag_entries)))
+        self.health_stat_values["Missing art"].setText(str(len(art_entries)))
+        self.health_stat_values["Missing files"].setText(str(len(missing_entries)))
+        self.health_stat_values["Orphaned files"].setText(str(len(orphan_entries)))
         self._populate_health_list(self.health_category_combo.currentText())
 
     def refresh_health_if_active(self):
@@ -2277,9 +2487,9 @@ class AddTracksDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
-        cancel_btn = QPushButton("CLOSE")
+        cancel_btn = QPushButton("Close")
         cancel_btn.clicked.connect(self.reject)
-        add_btn = QPushButton("ADD SELECTED")
+        add_btn = QPushButton("Add selected")
         add_btn.setObjectName("primary")
         add_btn.clicked.connect(self._add_selected)
         btn_row.addWidget(cancel_btn)
@@ -2351,7 +2561,7 @@ class AddToPlaylistDialog(QDialog):
         new_row = QHBoxLayout()
         self.new_name_edit = QLineEdit()
         self.new_name_edit.setPlaceholderText("New playlist name...")
-        new_btn = QPushButton("+ CREATE")
+        new_btn = QPushButton("+ Create")
         new_btn.clicked.connect(self._create_and_add)
         new_row.addWidget(self.new_name_edit, stretch=1)
         new_row.addWidget(new_btn)
@@ -2359,9 +2569,9 @@ class AddToPlaylistDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
-        cancel_btn = QPushButton("CANCEL")
+        cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        add_btn = QPushButton("ADD")
+        add_btn = QPushButton("Add")
         add_btn.setObjectName("primary")
         add_btn.clicked.connect(self._add_to_selected)
         btn_row.addWidget(cancel_btn)
@@ -2429,19 +2639,19 @@ class PlaylistView(QWidget):
         self._mosaic_cache = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
         hero_row = QHBoxLayout()
         hero_row.setSpacing(16)
-        self.art_tile = ChamferedArtTile(size=96, chamfer=16, clickable=True)
+        self.art_tile = RoundedArtTile(size=96, radius=16, clickable=True)
         self.art_tile.clicked.connect(self._choose_artwork)
         hero_row.addWidget(self.art_tile)
 
         meta_col = QVBoxLayout()
         meta_col.setSpacing(3)
-        meta_col.addWidget(PixelLabel("PLAYLIST", point_size=9, color=MUTED, letter_spacing=2))
-        self.title_label = PixelLabel("", point_size=16, letter_spacing=1)
+        meta_col.addWidget(DisplayLabel("Playlist", point_size=10, color=MUTED, letter_spacing=1))
+        self.title_label = DisplayLabel("", point_size=20, letter_spacing=0)
         meta_col.addWidget(self.title_label)
         self.subtitle_label = QLabel("")
         self.subtitle_label.setObjectName("muted")
@@ -2451,10 +2661,10 @@ class PlaylistView(QWidget):
         layout.addLayout(hero_row)
 
         top_row = QHBoxLayout()
-        add_btn = QPushButton("ADD TRACKS...")
+        add_btn = QPushButton("Add tracks…")
         add_btn.clicked.connect(self._open_add_tracks_dialog)
         top_row.addWidget(add_btn)
-        add_files_btn = QPushButton("ADD FILES...")
+        add_files_btn = QPushButton("Add files…")
         add_files_btn.clicked.connect(self._open_add_files_dialog)
         top_row.addWidget(add_files_btn)
         top_row.addStretch(1)
@@ -2462,17 +2672,17 @@ class PlaylistView(QWidget):
         settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Playlist actions")
         settings_menu = QMenu(self)
-        edit_tags_action = QAction("EDIT TAGS", self)
+        edit_tags_action = QAction("Edit tags", self)
         edit_tags_action.triggered.connect(self._edit_tags_selected)
-        remove_artwork_action = QAction("REMOVE ARTWORK", self)
+        remove_artwork_action = QAction("Remove artwork", self)
         remove_artwork_action.triggered.connect(self._remove_artwork)
-        remove_action = QAction("REMOVE SELECTED", self)
+        remove_action = QAction("Remove selected from playlist", self)
         remove_action.triggered.connect(self._remove_selected)
-        copy_action = QAction("COPY SELECTED...", self)
+        copy_action = QAction("Copy selected…", self)
         copy_action.triggered.connect(self._copy_selected)
-        export_action = QAction("EXPORT...", self)
+        export_action = QAction("Export…", self)
         export_action.triggered.connect(self._open_export_dialog)
-        delete_action = QAction("DELETE PLAYLIST", self)
+        delete_action = QAction("Delete playlist", self)
         delete_action.triggered.connect(self._delete_playlist)
         settings_menu.addAction(edit_tags_action)
         settings_menu.addAction(remove_artwork_action)
@@ -2487,11 +2697,8 @@ class PlaylistView(QWidget):
         top_row.addWidget(settings_btn)
         layout.addLayout(top_row)
 
-        hint = QLabel("Drag tracks to reorder.")
-        hint.setObjectName("muted")
-        layout.addWidget(hint)
 
-        self.track_list = TrackListWidget()
+        self.track_list = TrackListWidget(PLAYLIST_COLUMNS)
         self.track_list.setItemDelegate(TrackRowDelegate(self.track_list))
         self.track_list.setMouseTracking(True)
         self.track_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
@@ -2499,12 +2706,40 @@ class PlaylistView(QWidget):
         self.track_list.model().rowsMoved.connect(lambda *a: self._persist_order())
         self.track_list.itemDoubleClicked.connect(self._play_from_playlist)
         self.track_list.infoClicked.connect(self._show_track_info_by_id)
+        # Order here is the playlist's own (drag to reorder), so the header
+        # labels the columns but doesn't sort.
+        self.track_list.model().rowsMoved.connect(lambda *a: self._renumber())
+        layout.addWidget(TrackColumnHeader(self.track_list, set(), show_in=False))
         layout.addWidget(self.track_list, stretch=1)
+
+        bar = SelectionBar([self.track_list], hint="Drag to reorder. Select tracks to act on them, or right-click one")
+        bar.add_button("Edit tags", self._edit_tags_selected)
+        bar.add_button("Copy…", self._copy_selected)
+        bar.add_button("Remove from playlist", self._remove_selected)
+        layout.addWidget(bar)
+
+        def track_menu(menu, item):
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            if len(self.track_list.selectedItems()) == 1:
+                add_menu_action(menu, "Play from here", lambda: self._play_from_playlist(item))
+                add_menu_action(menu, "Edit tags", self._edit_tags_selected)
+                add_menu_action(menu, "Track info", lambda: self._show_track_info_by_id(data["id"]))
+            add_menu_action(menu, "Copy…", self._copy_selected)
+            menu.addSeparator()
+            add_menu_action(menu, "Remove from playlist", self._remove_selected)
+        attach_context_menu(self.track_list, track_menu)
+
+    def _renumber(self):
+        for i in range(self.track_list.count()):
+            item = self.track_list.item(i)
+            data = dict(item.data(Qt.ItemDataRole.UserRole) or {})
+            data["pos"] = str(i + 1)
+            item.setData(Qt.ItemDataRole.UserRole, data)
 
     def show_playlist(self, playlist_id: int, name: str):
         self._playlist_id = playlist_id
         self._playlist_name = name
-        self.title_label.setText(name.upper())
+        self.title_label.setText(name)
         self.refresh()
 
     def _library_root_or_none(self) -> str | None:
@@ -2532,8 +2767,11 @@ class PlaylistView(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, {
                     "id": row["id"],
                     "library_path": path,
+                    "pos": str(track_count + 1),
                     "title": row["title"] or Path(path).stem,
                     "artist": row["artist"] or "",
+                    "album": row["album"] or "",
+                    "time": _format_length(row["duration_seconds"]),
                     "badge": None,  # playlist order is the point here, not membership count
                     "loudness_lufs": row["loudness_lufs"],
                     "loudness_true_peak": row["loudness_true_peak"],
@@ -2765,6 +3003,7 @@ class AudiobookSeriesView(QWidget):
     "remove" concept the way PlaylistView's REMOVE SELECTED has."""
 
     backRequested = pyqtSignal()
+    libraryChanged = pyqtSignal()  # books were deleted — MainWindow refreshes the library/shelf counts
     playRequested = pyqtSignal(list, int)  # queue (dicts with id/title/artist/path/kind), start index
     fixTagsRequested = pyqtSignal(str, int)  # mp3 path, track_id — same contract as the other views'
 
@@ -2774,23 +3013,23 @@ class AudiobookSeriesView(QWidget):
         self._series_name = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        back_btn = QPushButton("‹ AUDIOBOOKS")
+        back_btn = QPushButton("‹ Audiobooks")
         back_btn.clicked.connect(self.backRequested.emit)
         layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
         hero_row = QHBoxLayout()
         hero_row.setSpacing(16)
-        self.art_tile = ChamferedArtTile(size=96, chamfer=16, clickable=True)
+        self.art_tile = RoundedArtTile(size=96, radius=16, clickable=True)
         self.art_tile.clicked.connect(self._choose_artwork)
         hero_row.addWidget(self.art_tile)
 
         meta_col = QVBoxLayout()
         meta_col.setSpacing(3)
-        meta_col.addWidget(PixelLabel("AUDIOBOOK SERIES", point_size=9, color=MUTED, letter_spacing=2))
-        self.title_label = PixelLabel("", point_size=16, letter_spacing=1)
+        meta_col.addWidget(DisplayLabel("Audiobook series", point_size=10, color=MUTED, letter_spacing=1))
+        self.title_label = DisplayLabel("", point_size=20, letter_spacing=0)
         meta_col.addWidget(self.title_label)
         self.subtitle_label = QLabel("")
         self.subtitle_label.setObjectName("muted")
@@ -2801,9 +3040,13 @@ class AudiobookSeriesView(QWidget):
         settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Series actions")
         settings_menu = QMenu(self)
-        remove_artwork_action = QAction("REMOVE ARTWORK", self)
+        remove_artwork_action = QAction("Remove artwork", self)
         remove_artwork_action.triggered.connect(self._remove_artwork)
         settings_menu.addAction(remove_artwork_action)
+        settings_menu.addSeparator()
+        delete_series_action = QAction("Delete series…", self)
+        delete_series_action.triggered.connect(self._delete_series)
+        settings_menu.addAction(delete_series_action)
         settings_btn.setMenu(settings_menu)
         hero_row.addWidget(settings_btn)
         layout.addLayout(hero_row)
@@ -2818,24 +3061,29 @@ class AudiobookSeriesView(QWidget):
         self.track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.track_list.infoClicked.connect(self._show_track_info_by_id)
         self.track_list.thumbnailClicked.connect(self._play_book)
+        self.track_list.enable_file_drag(self._get_library_root)
         layout.addWidget(self.track_list, stretch=1)
 
-        action_row = QHBoxLayout()
-        action_row.addStretch(1)
-        edit_tags_btn = QPushButton("EDIT TAGS")
-        edit_tags_btn.clicked.connect(self._edit_tags_selected)
-        action_row.addWidget(edit_tags_btn)
-        remove_btn = QPushButton("REMOVE SELECTED")
-        remove_btn.clicked.connect(self._remove_selected)
-        action_row.addWidget(remove_btn)
-        copy_btn = QPushButton("COPY SELECTED...")
-        copy_btn.clicked.connect(self._copy_selected)
-        action_row.addWidget(copy_btn)
-        layout.addLayout(action_row)
+        bar = SelectionBar([self.track_list])
+        bar.add_button("Edit tags", self._edit_tags_selected)
+        bar.add_button("Copy…", self._copy_selected)
+        bar.add_button("Delete…", self._remove_selected, danger=True)
+        layout.addWidget(bar)
+
+        def book_menu(menu, item):
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            if len(self.track_list.selectedItems()) == 1:
+                add_menu_action(menu, "Play from here", lambda: self._play_book(data["id"]))
+                add_menu_action(menu, "Edit tags", self._edit_tags_selected)
+                add_menu_action(menu, "Track info", lambda: self._show_track_info_by_id(data["id"]))
+            add_menu_action(menu, "Copy…", self._copy_selected)
+            menu.addSeparator()
+            add_menu_action(menu, "Delete…", self._remove_selected, danger=True)
+        attach_context_menu(self.track_list, book_menu)
 
     def show_series(self, series_name: str):
         self._series_name = series_name
-        self.title_label.setText(series_name.upper())
+        self.title_label.setText(series_name)
         self.refresh()
 
     def _library_root_or_none(self) -> str | None:
@@ -2866,9 +3114,9 @@ class AudiobookSeriesView(QWidget):
             book_num = _parse_book_number(book["tracknumber"])
             title = book["title"] or Path(book["library_path"]).stem
             display_title = f"{book_num}. {title}" if book_num is not None else title
-            subtitle = f"{book['artist'] or 'Unknown Author'} · {_format_duration(book['duration_seconds'])}"
+            subtitle = f"{book['artist'] or 'Unknown Author'} · {_format_length(book['duration_seconds']) or '—'}"
             item = QListWidgetItem()
-            item.setIcon(QIcon(render_chamfered_pixmap(art_bytes, 40, 8)))
+            item.setIcon(QIcon(render_rounded_pixmap(art_bytes, 40, 8)))
             item.setData(Qt.ItemDataRole.UserRole, {
                 "id": book["id"],
                 "library_path": book["library_path"],
@@ -2979,34 +3227,23 @@ class AudiobookSeriesView(QWidget):
         library_root = self._library_root_or_none()
         if not library_root:
             return
-        reply = QMessageBox.question(
-            self, "Remove from library",
-            f"Permanently delete {len(items)} book(s) from your library? This only removes "
-            f"Splice's own copy — nothing at your original source location is touched.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        tracks = [(i.data(Qt.ItemDataRole.UserRole)["id"], i.data(Qt.ItemDataRole.UserRole)["library_path"])
+                  for i in items]
+        if delete_library_tracks(self, library_root, tracks, noun="book") > 0:
+            self.refresh()
+            self.libraryChanged.emit()
+            if self.track_list.count() == 0:
+                self.backRequested.emit()  # nothing left in this series
+
+    def _delete_series(self):
+        library_root = self._library_root_or_none()
+        if not library_root or self._series_name is None:
             return
-        conn = libdb.open_db(library_root)
-        failed = []
-        for item in items:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            path = Path(library_root) / data["library_path"]
-            error = _try_unlink(path)
-            if error:
-                failed.append(path.name)
-                continue  # leave its index entry in place — the file's still really there
-            libdb.delete_track(conn, data["id"])  # audiobooks are never in playlists — no m3u8 cleanup needed
-        conn.close()
-        self.refresh()
-        if failed:
-            QMessageBox.warning(
-                self, "Some books couldn't be removed",
-                "These are currently in use by another program, so they weren't removed "
-                "(nothing changed for them — try again once whatever has them open is closed):\n\n"
-                + "\n".join(failed),
-            )
+        if delete_audiobook_series(self, library_root, self._series_name) > 0:
+            self.libraryChanged.emit()
+            self.refresh()
+            if self.track_list.count() == 0:
+                self.backRequested.emit()
 
     def _copy_selected(self):
         items = self.track_list.selectedItems()
