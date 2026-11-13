@@ -919,16 +919,27 @@ class ResolveDuplicateDialog(QDialog):
     duration, and live file size (the two cheap signals that actually help
     judge "which copy is better", e.g. a larger file usually means a higher
     bitrate rip) — and lets the user pick which one to keep. Returns the
-    decision via self.keep_id/self.remove_id after exec() accepts; does no
-    deletion itself, that's the caller's job."""
+    decision via self.action ("keep" / "skip" / "dismiss") plus
+    self.keep_id/self.remove_id after exec() accepts; a reject (STOP or
+    closing the window) means stop going through pairs. Does no deletion
+    itself, that's the caller's job. `position` is a "(2 of 7)"-style label
+    shown in the title while the caller steps through the whole list."""
 
-    def __init__(self, parent, library_root: str, track_a, track_b):
+    GEOMETRY_KEY = "resolve_dupe_dialog/geometry"
+
+    def __init__(self, parent, library_root: str, track_a, track_b, position: str = ""):
         super().__init__(parent)
+        self.action = None
         self.keep_id = None
         self.remove_id = None
         self._library_root = library_root
-        self.setWindowTitle("Resolve Duplicate")
-        self.resize(560, 260)
+        self.setWindowTitle(f"Resolve Duplicate {position}".strip())
+        # Reuse whatever size/position the last one was left at, so stepping
+        # through pairs (and later sessions) doesn't snap back to the default.
+        self._settings = QSettings("Thomas", "Splice")
+        saved = self._settings.value(self.GEOMETRY_KEY)
+        if saved is None or not self.restoreGeometry(saved):
+            self.resize(560, 260)
 
         layout = QVBoxLayout(self)
         hint = QLabel("These look like the same track. Pick which copy to keep — the other is "
@@ -943,8 +954,16 @@ class ResolveDuplicateDialog(QDialog):
         layout.addLayout(columns)
 
         cancel_row = QHBoxLayout()
+        dismiss_btn = QPushButton("NOT A DUPLICATE")
+        dismiss_btn.setToolTip("Keep both copies and stop flagging this pair")
+        dismiss_btn.clicked.connect(lambda: self._finish("dismiss"))
+        cancel_row.addWidget(dismiss_btn)
+        skip_btn = QPushButton("SKIP")
+        skip_btn.setToolTip("Leave this pair for later and go to the next one")
+        skip_btn.clicked.connect(lambda: self._finish("skip"))
+        cancel_row.addWidget(skip_btn)
         cancel_row.addStretch(1)
-        cancel_btn = QPushButton("CANCEL")
+        cancel_btn = QPushButton("STOP")
         cancel_btn.clicked.connect(self.reject)
         cancel_row.addWidget(cancel_btn)
         layout.addLayout(cancel_row)
@@ -973,7 +992,142 @@ class ResolveDuplicateDialog(QDialog):
     def _choose(self, keep_id: int, remove_id: int):
         self.keep_id = keep_id
         self.remove_id = remove_id
+        self._finish("keep")
+
+    def _finish(self, action: str):
+        self.action = action
         self.accept()
+
+    def done(self, result: int):
+        # Every way out (KEEP/SKIP/NOT A DUPLICATE, STOP, Esc, the window's X) goes through done().
+        self._settings.setValue(self.GEOMETRY_KEY, self.saveGeometry())
+        super().done(result)
+
+
+def _norm_tag(value) -> str:
+    """Case/whitespace-insensitive form of a tag for "is this the same song" checks."""
+    return " ".join((value or "").casefold().split())
+
+
+AUTO_RESOLVE_MAX_DURATION_GAP = 5.0  # seconds; a bigger gap suggests a different version (live, edit, ...)
+
+
+def plan_auto_resolve(library_root: str, pairs, require_album: bool) -> tuple[list[dict], int]:
+    """Decides which duplicate pairs are safe to resolve without asking: same
+    title and artist (and album, if require_album), durations within a few
+    seconds of each other, both files present on disk. For each one, keeps
+    the larger file — usually the higher-bitrate rip — and on a tie the
+    older track. `pairs` is a list of (dupe_id, track_a, track_b). Returns
+    (plan, left_for_review), each plan entry a dict with dupe_id, keep,
+    remove, keep_size, remove_size. A pair whose track is already slated
+    for removal is skipped (its row disappears with that track anyway). A
+    kept track can still lose to an even larger copy in a later pair
+    (A<B, B<C ends with only C), which is fine since each step keeps the
+    bigger file, and execution runs in this order so playlist entries
+    follow along A→B→C."""
+    plan = []
+    removing = set()
+    for dupe_id, a, b in pairs:
+        if a["id"] in removing or b["id"] in removing:
+            continue
+        if not _norm_tag(a["title"]) or _norm_tag(a["title"]) != _norm_tag(b["title"]):
+            continue
+        if _norm_tag(a["artist"]) != _norm_tag(b["artist"]):
+            continue
+        if require_album and _norm_tag(a["album"]) != _norm_tag(b["album"]):
+            continue
+        da, db_ = a["duration_seconds"], b["duration_seconds"]
+        if da and db_ and abs(da - db_) > AUTO_RESOLVE_MAX_DURATION_GAP:
+            continue
+        try:
+            size_a = (Path(library_root) / a["library_path"]).stat().st_size
+            size_b = (Path(library_root) / b["library_path"]).stat().st_size
+        except OSError:
+            continue  # a missing file is a Health problem, not a judgement call
+        if size_a > size_b or (size_a == size_b and a["id"] < b["id"]):
+            keep, remove, keep_size, remove_size = a, b, size_a, size_b
+        else:
+            keep, remove, keep_size, remove_size = b, a, size_b, size_a
+        removing.add(remove["id"])
+        plan.append({"dupe_id": dupe_id, "keep": keep, "remove": remove,
+                     "keep_size": keep_size, "remove_size": remove_size})
+    return plan, len(pairs) - len(plan)
+
+
+class AutoResolveDialog(QDialog):
+    """Preview for AUTO-RESOLVE: lists every pair plan_auto_resolve would
+    handle (which copy is kept, which is deleted, and their sizes) so the
+    user can sanity-check before anything is removed. Nothing is deleted
+    here — after exec() accepts, the caller acts on self.plan."""
+
+    GEOMETRY_KEY = "auto_resolve_dialog/geometry"
+
+    def __init__(self, parent, library_root: str, pairs):
+        super().__init__(parent)
+        self._library_root = library_root
+        self._pairs = pairs
+        self.plan = []
+        self.setWindowTitle("Auto-Resolve Duplicates")
+        self._settings = QSettings("Thomas", "Splice")
+        saved = self._settings.value(self.GEOMETRY_KEY)
+        if saved is None or not self.restoreGeometry(saved):
+            self.resize(720, 460)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "Pairs with the same title and artist, and lengths within "
+            f"{AUTO_RESOLVE_MAX_DURATION_GAP:.0f} seconds of each other, keep the larger file "
+            "(usually the higher-quality copy). The smaller one is permanently deleted from your "
+            "library and its playlist entries point at the kept copy. Everything else stays in "
+            "the list for you to review."
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.album_check = QCheckBox("Only when the album matches too")
+        self.album_check.setChecked(self._settings.value("auto_resolve_dialog/require_album", False, type=bool))
+        self.album_check.toggled.connect(self._replan)
+        layout.addWidget(self.album_check)
+
+        self.preview_list = QListWidget()
+        layout.addWidget(self.preview_list, 1)
+
+        self.summary = QLabel()
+        self.summary.setObjectName("muted")
+        layout.addWidget(self.summary)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("CANCEL")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        self.go_btn = QPushButton()
+        self.go_btn.setObjectName("primary")
+        self.go_btn.clicked.connect(self.accept)
+        buttons.addWidget(self.go_btn)
+        layout.addLayout(buttons)
+
+        self._replan()
+
+    def _replan(self):
+        self.plan, left = plan_auto_resolve(self._library_root, self._pairs, self.album_check.isChecked())
+        self.preview_list.clear()
+        for entry in self.plan:
+            keep, remove = entry["keep"], entry["remove"]
+            self.preview_list.addItem(
+                f"{keep['title']} — {keep['artist']}\n"
+                f"   KEEP     {keep['library_path']}  ({entry['keep_size'] / (1024 * 1024):.1f} MB)\n"
+                f"   DELETE   {remove['library_path']}  ({entry['remove_size'] / (1024 * 1024):.1f} MB)"
+            )
+        self.summary.setText(f"{len(self.plan)} pair(s) will be resolved · {left} left for manual review")
+        self.go_btn.setText(f"RESOLVE {len(self.plan)} PAIR(S)")
+        self.go_btn.setEnabled(bool(self.plan))
+
+    def done(self, result: int):
+        self._settings.setValue(self.GEOMETRY_KEY, self.saveGeometry())
+        self._settings.setValue("auto_resolve_dialog/require_album", self.album_check.isChecked())
+        super().done(result)
 
 
 def _format_added_date(added_at: str | None) -> str:
@@ -1269,6 +1423,10 @@ class LibraryView(QWidget):
         dupe_row = QHBoxLayout(self.dupe_actions)
         dupe_row.setContentsMargins(0, 0, 0, 0)
         dupe_row.addStretch(1)
+        auto_resolve_btn = QPushButton("AUTO-RESOLVE...")
+        auto_resolve_btn.setToolTip("Keep the larger copy of every pair with matching title/artist")
+        auto_resolve_btn.clicked.connect(self._auto_resolve_dupes)
+        dupe_row.addWidget(auto_resolve_btn)
         resolve_btn = QPushButton("RESOLVE...")
         resolve_btn.clicked.connect(self._resolve_selected_dupe)
         dupe_row.addWidget(resolve_btn)
@@ -1713,32 +1871,90 @@ class LibraryView(QWidget):
         self.refresh()
 
     def _resolve_selected_dupe(self):
-        item = self.duplicates_list.currentItem()
-        if item is None:
-            QMessageBox.information(self, "Nothing selected", "Click a duplicate pair in the list first.")
+        """Steps through the duplicates list one pair after another, starting
+        at the selected pair (or the top if nothing's selected) — each choice
+        opens the next pair's dialog straight away, until the list runs out
+        or the user hits STOP. Pairs are re-read from the DB as we go, since
+        deleting a track also drops any later pair that involved it."""
+        count = self.duplicates_list.count()
+        if count == 0:
+            QMessageBox.information(self, "No duplicates", "There are no duplicate pairs to resolve.")
             return
         library_root = self._get_library_root()
         if not library_root:
             return
-        dupe_id = item.data(Qt.ItemDataRole.UserRole)
-        conn = libdb.open_db(library_root)
-        dupe_row = conn.execute("SELECT * FROM fuzzy_dupes WHERE id = ?", (dupe_id,)).fetchone()
-        if not dupe_row:
+        start = max(self.duplicates_list.currentRow(), 0)
+        dupe_ids = [self.duplicates_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(start, count)]
+
+        changed = False
+        for index, dupe_id in enumerate(dupe_ids, start=1):
+            conn = libdb.open_db(library_root)
+            dupe_row = conn.execute(
+                "SELECT * FROM fuzzy_dupes WHERE id = ? AND resolved = 0", (dupe_id,)
+            ).fetchone()
+            track_a = track_b = None
+            if dupe_row:
+                track_a = conn.execute("SELECT * FROM tracks WHERE id = ?", (dupe_row["track_id_a"],)).fetchone()
+                track_b = conn.execute("SELECT * FROM tracks WHERE id = ?", (dupe_row["track_id_b"],)).fetchone()
             conn.close()
-            return
-        track_a = conn.execute("SELECT * FROM tracks WHERE id = ?", (dupe_row["track_id_a"],)).fetchone()
-        track_b = conn.execute("SELECT * FROM tracks WHERE id = ?", (dupe_row["track_id_b"],)).fetchone()
-        conn.close()
-        if not track_a or not track_b:
-            QMessageBox.information(self, "Already resolved", "One of these tracks no longer exists.")
+            if not track_a or not track_b:
+                continue  # already handled by an earlier choice in this pass
+
+            dialog = ResolveDuplicateDialog(
+                self, library_root, track_a, track_b, position=f"({index} of {len(dupe_ids)})"
+            )
+            if not dialog.exec():
+                break  # STOP / window closed
+            if dialog.action == "keep":
+                if not self._resolve_dupe(dialog.keep_id, dialog.remove_id, refresh=False):
+                    break  # file in use — warning already shown, don't keep going
+                changed = True
+            elif dialog.action == "dismiss":
+                conn = libdb.open_db(library_root)
+                libdb.resolve_fuzzy_dupe(conn, dupe_id)
+                conn.close()
+                changed = True
+            # "skip": just move on to the next pair
+
+        if changed:
             self.refresh()
+
+    def _auto_resolve_dupes(self):
+        library_root = self._get_library_root()
+        if not library_root:
+            return
+        conn = libdb.open_db(library_root)
+        pairs = []
+        for d in libdb.list_unresolved_fuzzy_dupes(conn):
+            a = conn.execute("SELECT * FROM tracks WHERE id = ?", (d["track_id_a"],)).fetchone()
+            b = conn.execute("SELECT * FROM tracks WHERE id = ?", (d["track_id_b"],)).fetchone()
+            if a and b:
+                pairs.append((d["id"], a, b))
+        conn.close()
+        if not pairs:
+            QMessageBox.information(self, "No duplicates", "There are no duplicate pairs to resolve.")
             return
 
-        dialog = ResolveDuplicateDialog(self, library_root, track_a, track_b)
-        if dialog.exec() and dialog.keep_id is not None:
-            self._resolve_dupe(dialog.keep_id, dialog.remove_id)
+        dialog = AutoResolveDialog(self, library_root, pairs)
+        if not dialog.exec() or not dialog.plan:
+            return
+        resolved, in_use = 0, []
+        for entry in dialog.plan:
+            if self._resolve_dupe(entry["keep"]["id"], entry["remove"]["id"], refresh=False, warn=False):
+                resolved += 1
+            else:
+                in_use.append(entry["remove"]["library_path"])
+        self.refresh()
+        message = f"Resolved {resolved} duplicate pair(s)."
+        remaining = self.duplicates_list.count()
+        if remaining:
+            message += f"\n\n{remaining} pair(s) still need a look — use RESOLVE... for those."
+        if in_use:
+            message += ("\n\nThese files are in use by another program and were left alone "
+                        "(nothing changed for them):\n\n" + "\n".join(in_use))
+        QMessageBox.information(self, "Auto-resolve finished", message)
 
-    def _resolve_dupe(self, keep_id: int, remove_id: int):
+    def _resolve_dupe(self, keep_id: int, remove_id: int, refresh: bool = True, warn: bool = True) -> bool:
         library_root = self._get_library_root()
         conn = libdb.open_db(library_root)
         row = conn.execute("SELECT library_path FROM tracks WHERE id = ?", (remove_id,)).fetchone()
@@ -1746,12 +1962,14 @@ class LibraryView(QWidget):
             error = _try_unlink(Path(library_root) / row["library_path"])
             if error:
                 conn.close()
+                if not warn:
+                    return False
                 QMessageBox.warning(
                     self, "Couldn't resolve",
                     "That file is currently in use by another program and can't be removed yet — "
                     "close whatever has it open and try again. Nothing was changed.",
                 )
-                return
+                return False
         affected_playlist_ids = libdb.playlists_containing_track(conn, remove_id)
         for playlist_id in affected_playlist_ids:
             position = libdb.next_playlist_position(conn, playlist_id)
@@ -1763,7 +1981,9 @@ class LibraryView(QWidget):
                 paths = libdb.playlist_track_paths_in_order(conn, playlist_id)
                 write_m3u8(str(Path(library_root) / "Playlists"), prow["name"], paths, library_root)
         conn.close()
-        self.refresh()
+        if refresh:
+            self.refresh()
+        return True
 
     def _fix_selected_unsorted_tags(self):
         items = self.unsorted_list.selectedItems()

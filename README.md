@@ -12,7 +12,7 @@ seek/resume), downloading straight from YouTube, and editing ID3 tags.
 
 ## Setup
 
-Requires Python 3 and [ffmpeg](https://ffmpeg.org/).
+Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org/).
 
 ```bash
 pip install -r requirements.txt
@@ -21,12 +21,104 @@ pip install -r requirements.txt
 **ffmpeg:**
 - macOS: `brew install ffmpeg`
 - Windows: `winget install ffmpeg` (or `choco install ffmpeg` / `scoop install ffmpeg`)
+- Ubuntu/Debian: `sudo apt install ffmpeg` (see below for the full Linux steps)
 
 ## Usage
 
 ```bash
 python splice.py
 ```
+
+## Running on Ubuntu / Linux
+
+Tested on Ubuntu; other distros work the same way with their own package
+manager (`dnf`, `pacman`, ...).
+
+**1. Install system packages** — Python with venv support, ffmpeg, and the
+X11/XCB libraries Qt 6 needs to open a window (`libxcb-cursor0` in particular
+is missing on a stock Ubuntu install and is the usual reason PyQt6 apps fail to
+start):
+
+```bash
+sudo apt update
+sudo apt install python3 python3-venv python3-pip ffmpeg libxcb-cursor0 libxkbcommon-x11-0 libegl1
+```
+
+**2. Create a virtual environment and install dependencies.** Recent Ubuntu
+releases (23.04+) block `pip install` into the system Python
+("externally-managed-environment"), so use a venv inside the project folder:
+
+```bash
+cd /path/to/splice
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+**3. Run it:**
+
+```bash
+python splice.py
+```
+
+Next time, just activate the venv and run — or skip activating and call the
+venv's Python directly:
+
+```bash
+.venv/bin/python splice.py
+```
+
+**Running from VS Code.** The repo ships a `.vscode/` config that points VS
+Code at the project's `.venv` and adds a **Run Splice** launch configuration.
+After the one-time setup above (venv created, requirements installed):
+
+1. Open the project folder in VS Code (`code /path/to/splice`). Install the
+   Microsoft **Python** extension if prompted.
+2. Check the interpreter in the bottom-right status bar says `.venv`. If it
+   doesn't, press `Ctrl+Shift+P` → **Python: Select Interpreter** → pick
+   `./.venv/bin/python`. VS Code remembers this choice for the folder.
+3. Press **F5** (or Run and Debug → **Run Splice**). New terminals opened
+   inside VS Code also activate the venv automatically, so `python splice.py`
+   works there too.
+
+If you created the venv while VS Code was already open, run **Developer:
+Reload Window** so it picks it up.
+
+**Optional: launcher icon.** To start Splice from your app menu, create
+`~/.local/share/applications/splice.desktop` (replace `/path/to/splice` with
+the real path):
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Splice
+Comment=Organize, merge, split, download and tag mp3s
+Exec=/path/to/splice/.venv/bin/python /path/to/splice/splice.py
+Path=/path/to/splice
+Terminal=false
+Categories=AudioVideo;Audio;
+```
+
+**Troubleshooting**
+
+- *`qt.qpa.plugin: Could not load the Qt platform plugin "xcb"`* — a Qt system
+  library is missing. Install the packages from step 1; to see exactly which
+  library is missing, run `QT_DEBUG_PLUGINS=1 python splice.py`.
+- *Wayland sessions* — Qt falls back to XWayland automatically. To force native
+  Wayland, run `QT_QPA_PLATFORM=wayland python splice.py` (needs
+  `sudo apt install qt6-wayland` on some setups).
+- *`GLib-GIO-ERROR: Settings schema 'org.gnome.settings-daemon.plugins.xsettings'
+  does not contain a key named 'antialiasing'` / "Aborted (core dumped)"* — you
+  launched from the **snap** build of VS Code, whose terminal points GTK at the
+  snap's old bundled GNOME schemas. `splice.py` now undoes this automatically on
+  startup; if you still see it (e.g. running another Qt script), launch from a
+  regular terminal, or install VS Code from Microsoft's `.deb` instead of the snap.
+- *"ffmpeg was not found on your PATH"* — `sudo apt install ffmpeg`, then
+  confirm with `ffmpeg -version`. Avoid the snap version of ffmpeg if you hit
+  permission errors reading files outside your home folder.
+- *YouTube downloads failing* — YouTube changes often; update yt-dlp inside the
+  venv with `pip install -U "yt-dlp[default,deno]"`.
 
 ## Project layout
 
@@ -67,6 +159,20 @@ Duplicate handling is conservative on purpose: exact byte-identical files are
 auto-deduplicated (only one copy is ever kept), but anything less certain — same
 title/artist with different underlying bytes — is left as two separate tracks and
 flagged in the **Duplicates** tab for you to review; nothing is ever auto-merged.
+Click **RESOLVE...** to go through them one after another, starting at the
+selected pair (or the top): each pick (**KEEP THIS ONE**, **SKIP**, or **NOT A
+DUPLICATE**) opens the next pair right away, until the list ends or you click
+**STOP**.
+
+For the common case — same song ripped twice — click **AUTO-RESOLVE...**
+instead. It picks out every pair with the same title and artist (ignoring
+case and spacing) whose lengths are within 5 seconds of each other, and keeps
+the larger file of each, usually the higher-bitrate copy. Tick **Only when the
+album matches too** to be stricter. You get a preview of exactly what will be
+kept and deleted before anything happens; playlist entries for a deleted copy
+move to the one kept. Anything that doesn't match (different titles, a live
+version with a different length, a missing file) stays in the list for
+**RESOLVE...**.
 Tracks with missing or unusable title/artist/album tags land in **Unsorted**
 instead of a guessed folder — select one and click **FIX TAGS** to jump straight
 to the Tags tool with it loaded.

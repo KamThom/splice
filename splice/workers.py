@@ -15,7 +15,8 @@ FFPROBE = shutil.which("ffprobe") or shutil.which("ffprobe.exe") or "ffprobe"
 FFMPEG_INSTALL_HINT = (
     "ffmpeg was not found on your PATH.\n\n"
     "macOS:   brew install ffmpeg\n"
-    "Windows: winget install ffmpeg  (or choco install ffmpeg / scoop install ffmpeg)\n\n"
+    "Windows: winget install ffmpeg  (or choco install ffmpeg / scoop install ffmpeg)\n"
+    "Linux:   sudo apt install ffmpeg  (or your distro's package manager)\n\n"
     "Then restart this app."
 )
 

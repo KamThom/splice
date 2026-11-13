@@ -1,4 +1,4 @@
 PyQt6
-yt-dlp
+yt-dlp[default,deno]
 mutagen
 blake3
