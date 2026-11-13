@@ -21,20 +21,40 @@ TARGET_LUFS = {"music": -14.0, "audiobook": -18.0}
 TRUE_PEAK_CEILING_DBTP = -1.0  # headroom so a boosted track never clips
 
 
-def measure_loudness(path: str) -> tuple[float, float] | None:
+def measure_loudness(path: str, register_process=None) -> tuple[float, float] | None:
     """Single-pass ffmpeg loudnorm analysis — input_i/input_tp are
     properties of the source and get measured regardless of what
     I=/TP=/LRA= targets are set, so no two-pass re-encode is needed just to
     measure. Returns (integrated_lufs, true_peak_dbtp), or None on any
-    failure (corrupt/missing/unsupported file, timeout)."""
+    failure (corrupt/missing/unsupported file, timeout).
+
+    Uses Popen instead of subprocess.run so the caller can get a handle to
+    the live ffmpeg process via register_process(process) and kill it on
+    demand (e.g. LoudnessAnalysisWorker.cancel(), or the app closing mid-
+    scan) — a large file can take minutes to measure, and without a way to
+    actually terminate it, cancelling only ever stopped the QThread loop
+    between files, never the ffmpeg subprocess already in flight. That's
+    exactly how an ffmpeg.exe can outlive the app entirely: Windows doesn't
+    kill child processes when their parent exits, so an unmanaged one just
+    keeps running (and keeps the file it's reading locked) indefinitely."""
+    process = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [FFMPEG, "-i", path, "-af", "loudnorm=print_format=json", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=600, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
         )
+        if register_process:
+            register_process(process)
+        _, stderr = process.communicate(timeout=600)
     except (OSError, subprocess.TimeoutExpired):
+        if process is not None:
+            process.kill()
+            process.communicate()
         return None
-    match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", result.stderr, re.DOTALL)
+    finally:
+        if register_process:
+            register_process(None)
+    match = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", stderr, re.DOTALL)
     if not match:
         return None
     try:
@@ -69,24 +89,37 @@ def gain_for_track(conn, library_path: str) -> float:
     return compute_gain_db(row["loudness_lufs"], row["loudness_true_peak"], row["kind"])
 
 
-def apply_gain_and_copy(src: Path, dest: Path, gain_db: float):
+def apply_gain_and_copy(src: Path, dest: Path, gain_db: float, register_process=None):
     """Copies src to dest, applying gain_db via an ffmpeg re-encode of the
     COPY ONLY — src (the library master) is never touched. Falls back to a
     plain shutil.copy2 if the gain is negligible (<0.5dB, nothing audibly
     worth an extra re-encode) or if ffmpeg fails for any reason, so this can
-    never simply drop a file from an export."""
+    never simply drop a file from an export. Popen + register_process for
+    the same reason as measure_loudness — lets a cancel (or the app
+    closing) actually kill the ffmpeg subprocess instead of leaving it to
+    finish (or hang) unsupervised."""
     if abs(gain_db) < 0.5:
         shutil.copy2(src, dest)
         return
+    process = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [FFMPEG, "-y", "-i", str(src), "-af", f"volume={gain_db}dB", "-q:a", "2", str(dest)],
-            capture_output=True, timeout=600,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        if result.returncode != 0 or not dest.exists():
+        if register_process:
+            register_process(process)
+        process.communicate(timeout=600)
+        if process.returncode != 0 or not dest.exists():
             shutil.copy2(src, dest)
     except (OSError, subprocess.TimeoutExpired):
+        if process is not None:
+            process.kill()
+            process.communicate()
         shutil.copy2(src, dest)
+    finally:
+        if register_process:
+            register_process(None)
 
 
 class LoudnessAnalysisWorker(QThread):
@@ -107,9 +140,19 @@ class LoudnessAnalysisWorker(QThread):
         super().__init__()
         self.library_root = library_root
         self._cancel_requested = False
+        self._process = None
 
     def cancel(self):
+        """Stops the loop between files AND kills whatever ffmpeg process is
+        currently in flight — without the latter, a large file mid-measurement
+        (this can take minutes) would just keep running as an orphan after
+        the worker "cancels", including when the whole app is closing."""
         self._cancel_requested = True
+        if self._process is not None and self._process.poll() is None:
+            self._process.kill()
+
+    def _set_process(self, process):
+        self._process = process
 
     def run(self):
         conn = libdb.open_db(self.library_root)
@@ -123,7 +166,7 @@ class LoudnessAnalysisWorker(QThread):
                     return
                 self.progress.emit(i, total)
                 abs_path = str(Path(self.library_root) / row["library_path"])
-                result = measure_loudness(abs_path)
+                result = measure_loudness(abs_path, register_process=self._set_process)
                 if result is None:
                     self.log.emit(f"[{ts()}] Could not measure loudness: {row['library_path']}")
                     continue

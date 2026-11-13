@@ -57,10 +57,16 @@ class CopyTracksWorker(QThread):
         self.library_paths = library_paths
         self.destination = destination
         self._cancel_requested = False
+        self._process = None
         self.report = CopyReport()
 
     def cancel(self):
         self._cancel_requested = True
+        if self._process is not None and self._process.poll() is None:
+            self._process.kill()
+
+    def _set_process(self, process):
+        self._process = process
 
     def run(self):
         total = len(self.library_paths)
@@ -82,7 +88,7 @@ class CopyTracksWorker(QThread):
                 try:
                     dest = unique_path(Path(self.destination) / src.name)
                     gain_db = loudness.gain_for_track(conn, rel_path)
-                    loudness.apply_gain_and_copy(src, dest, gain_db)
+                    loudness.apply_gain_and_copy(src, dest, gain_db, register_process=self._set_process)
                     self.report.copied_count += 1
                 except Exception as e:
                     self.report.failed_count += 1
@@ -125,10 +131,16 @@ class ExportWorker(QThread):
         self.items = items
         self.replace_existing = replace_existing
         self._cancel_requested = False
+        self._process = None
         self.report = ExportReport()
 
     def cancel(self):
         self._cancel_requested = True
+        if self._process is not None and self._process.poll() is None:
+            self._process.kill()
+
+    def _set_process(self, process):
+        self._process = process
 
     def run(self):
         conn = libdb.open_db(self.library_root)
@@ -193,7 +205,7 @@ class ExportWorker(QThread):
             dest_name = f"{i:0{width}d} - {sanitize_filename(title)}{src.suffix}"
             try:
                 gain_db = loudness.gain_for_track(conn, rel_path)
-                loudness.apply_gain_and_copy(src, dest_folder / dest_name, gain_db)
+                loudness.apply_gain_and_copy(src, dest_folder / dest_name, gain_db, register_process=self._set_process)
                 self.report.copied_count += 1
             except Exception as e:
                 self.report.failed_count += 1
@@ -229,7 +241,7 @@ class ExportWorker(QThread):
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 rel_path = path.relative_to(Path(self.library_root)).as_posix()
                 gain_db = loudness.gain_for_track(conn, rel_path)
-                loudness.apply_gain_and_copy(path, dest_path, gain_db)
+                loudness.apply_gain_and_copy(path, dest_path, gain_db, register_process=self._set_process)
                 self.report.copied_count += 1
             except Exception as e:
                 self.report.failed_count += 1
