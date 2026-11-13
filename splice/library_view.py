@@ -33,6 +33,11 @@ from PyQt6.QtWidgets import (
 )
 
 from . import tagging
+
+try:
+    from send2trash import send2trash
+except ImportError:  # not installed: deletes fall back to asking about permanent removal
+    send2trash = None
 from .library import db as libdb
 from .library import loudness
 from .library.export import (
@@ -108,21 +113,21 @@ def delete_library_tracks(parent, library_root: str, tracks: list[tuple[int, str
     reply = QMessageBox.question(
         parent, "Delete from library",
         (question or f"Delete {n:,} {plural} from your library?")
-        + "\n\nThis removes Splice's copy only. Your original source folders aren't touched. "
-          "It can't be undone.",
+        + "\n\nThey go to your system Trash, so you can get them back from there. This removes "
+          "Splice's copy only; your original source folders aren't touched.",
         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         QMessageBox.StandardButton.No,
     )
     if reply != QMessageBox.StandardButton.Yes:
         return -1
+    paths = [Path(library_root) / rel_path for _, rel_path in tracks]
+    results = remove_files(parent, paths)
     conn = libdb.open_db(library_root)
     affected_playlist_ids = set()
     failed = []
     deleted = 0
-    for track_id, rel_path in tracks:
-        path = Path(library_root) / rel_path
-        error = _try_unlink(path)
-        if error:
+    for (track_id, _rel), path in zip(tracks, paths):
+        if results.get(path):
             failed.append(path.name)
             continue  # leave its index entry in place — the file's still really there
         affected_playlist_ids.update(libdb.playlists_containing_track(conn, track_id))
@@ -137,9 +142,9 @@ def delete_library_tracks(parent, library_root: str, tracks: list[tuple[int, str
     conn.close()
     if failed:
         QMessageBox.warning(
-            parent, "Some files couldn't be deleted",
-            "These are open in another program, so they were left alone. Close whatever has "
-            "them open and try again:\n\n" + "\n".join(failed),
+            parent, "Some files were left in your library",
+            "These weren't deleted. They may be open in another program, or you chose not to "
+            "delete them permanently:\n\n" + "\n".join(failed),
         )
     return deleted
 
@@ -247,6 +252,48 @@ def choose_multiple_directories(parent, caption: str, start_dir: str) -> list[st
 
 def _is_unsorted(library_path: str) -> bool:
     return "_Unsorted" in Path(library_path).parts
+
+
+def remove_files(parent, paths: list[Path], decision: dict | None = None) -> dict:
+    """Removes library files by moving them to the system Trash, so a
+    mistaken delete can be undone from the file manager. Returns
+    {path: None if removed, else a short reason}.
+
+    If some can't be trashed (a drive without a Trash folder, a filesystem
+    that won't allow one, send2trash not installed) the user is asked ONCE
+    whether to delete those permanently instead. Pass the same `decision`
+    dict across calls (e.g. every pair in an auto-resolve) so that question
+    is only ever asked once per operation."""
+    decision = decision if decision is not None else {}
+    results: dict = {}
+    untrashable: list[Path] = []
+    for path in paths:
+        if not path.exists():
+            results[path] = None  # already gone
+            continue
+        if send2trash is None:
+            untrashable.append(path)
+            continue
+        try:
+            send2trash(str(path))
+            results[path] = None
+        except Exception:  # send2trash raises several types depending on platform/filesystem
+            untrashable.append(path)
+    if untrashable:
+        if "permanent" not in decision:
+            n = len(untrashable)
+            reply = QMessageBox.question(
+                parent, "Can't use the Trash",
+                f"{n:,} file{'' if n == 1 else 's'} couldn't be moved to the Trash (this drive may "
+                f"not have one). Delete {'it' if n == 1 else 'them'} permanently instead?\n\n"
+                f"This can't be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            decision["permanent"] = reply == QMessageBox.StandardButton.Yes
+        for path in untrashable:
+            results[path] = _try_unlink(path) if decision["permanent"] else "not moved to the Trash"
+    return results
 
 
 def _try_unlink(path: Path) -> str | None:
@@ -1134,7 +1181,7 @@ class ResolveDuplicateDialog(QDialog):
 
         layout = QVBoxLayout(self)
         hint = QLabel("These look like the same track. Pick which copy to keep — the other is "
-                      "permanently deleted from your library (originals elsewhere are never touched).")
+                      "moved to the Trash (originals elsewhere are never touched).")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -1268,7 +1315,7 @@ class AutoResolveDialog(QDialog):
         hint = QLabel(
             "Pairs with the same title and artist, and lengths within "
             f"{AUTO_RESOLVE_MAX_DURATION_GAP:.0f} seconds of each other, keep the larger file "
-            "(usually the higher-quality copy). The smaller one is permanently deleted from your "
+            "(usually the higher-quality copy). The smaller one goes to the Trash and is removed from your "
             "library and its playlist entries point at the kept copy. Everything else stays in "
             "the list for you to review."
         )
@@ -1308,8 +1355,8 @@ class AutoResolveDialog(QDialog):
             keep, remove = entry["keep"], entry["remove"]
             self.preview_list.addItem(
                 f"{keep['title']} — {keep['artist']}\n"
-                f"   KEEP     {keep['library_path']}  ({entry['keep_size'] / (1024 * 1024):.1f} MB)\n"
-                f"   DELETE   {remove['library_path']}  ({entry['remove_size'] / (1024 * 1024):.1f} MB)"
+                f"   Keep     {keep['library_path']}  ({entry['keep_size'] / (1024 * 1024):.1f} MB)\n"
+                f"   Trash    {remove['library_path']}  ({entry['remove_size'] / (1024 * 1024):.1f} MB)"
             )
         self.summary.setText(f"{len(self.plan)} pair(s) will be resolved · {left} left for manual review")
         self.go_btn.setText(f"Resolve {len(self.plan)} pair(s)")
@@ -1508,7 +1555,13 @@ class LibraryView(QWidget):
         self._search_debounce = QTimer(self)
         self._search_debounce.setSingleShot(True)
         self._search_debounce.setInterval(200)
-        self._search_debounce.timeout.connect(self.refresh)
+        # Search only re-filters the rows already loaded (_apply_filter) — it
+        # never reloads the library or tells the rest of the window it changed.
+        self._search_debounce.timeout.connect(self._apply_filter)
+        self._music_tracks: list = []
+        self._audiobook_tracks: list = []
+        self._membership: dict = {}
+        self._shown = {"songs": 0, "audiobooks": 0}
 
         self._counts = {"songs": 0, "audiobooks": 0, "duplicates": 0, "unsorted": 0,
                         "playtime": "", "series": 0}
@@ -1654,8 +1707,13 @@ class LibraryView(QWidget):
     def _section_header(self) -> tuple[str, str]:
         c = self._counts
         kind = self.current_section()
-        if kind == "songs":
+        searching = bool(self.search_edit.text().strip())
+        if kind == "songs" and searching:
+            summary = f"{self._shown['songs']:,} of {c['songs']:,} songs match"
+        elif kind == "songs":
             summary = f"{c['songs']:,} songs" + (f" · {c['playtime']}" if c["playtime"] else "")
+        elif kind == "audiobooks" and searching:
+            summary = f"{self._shown['audiobooks']:,} of {c['audiobooks']:,} files match"
         elif kind == "audiobooks":
             summary = f"{c['audiobooks']:,} files"
             if c["series"]:
@@ -1683,7 +1741,7 @@ class LibraryView(QWidget):
             # useful starting direction for those; A→Z for text columns.
             self._sort_ascending = field not in ("Date Added", "Time", "In")
         self._sync_sort_headers()
-        self.refresh()
+        self._apply_filter()
 
     def _sync_sort_headers(self):
         key = next((k for k, f in COLUMN_SORT_FIELDS.items() if f == self._sort_field), "title")
@@ -1825,7 +1883,6 @@ class LibraryView(QWidget):
             return
 
         conn = libdb.open_db(library_root)
-        query = self.search_edit.text().strip().lower()
         membership = libdb.playlist_membership_counts(conn)
 
         music_tracks = [t for t in libdb.list_tracks(conn, "music") if not _is_unsorted(t["library_path"])]
@@ -1833,12 +1890,8 @@ class LibraryView(QWidget):
         audiobook_tracks = libdb.list_tracks(conn, "audiobook")
         dupes = libdb.list_unresolved_fuzzy_dupes(conn)
 
-        sorted_music = sort_tracks(self._filter(music_tracks, query), membership, self._sort_field, self._sort_ascending)
-        sorted_audiobooks = sort_tracks(
-            self._filter(audiobook_tracks, query), membership, self._sort_field, self._sort_ascending
-        )
-        populate_track_list(self.songs_list, sorted_music, membership)
-        populate_track_list(self.audiobooks_list, sorted_audiobooks, membership)
+        self._music_tracks, self._audiobook_tracks, self._membership = music_tracks, audiobook_tracks, membership
+        self._apply_filter(emit_header=False)
         self._populate_unsorted(unsorted_tracks)
         self._populate_dupes(conn, dupes)
         self._refresh_audiobook_shelf(conn, library_root)
@@ -1857,6 +1910,22 @@ class LibraryView(QWidget):
                                 self._counts["duplicates"], self._counts["unsorted"])
         self._emit_header()
         self.libraryChanged.emit()
+
+    def _apply_filter(self, emit_header: bool = True):
+        """Re-filters and re-sorts the Songs / Audiobooks tables from the
+        rows the last refresh() loaded. This is all a search keystroke or a
+        column-header click does — no database reads, no shelf/cover work,
+        and no libraryChanged (which would rebuild the sidebar's playlists)."""
+        query = self.search_edit.text().strip().lower()
+        music = sort_tracks(self._filter(self._music_tracks, query), self._membership,
+                            self._sort_field, self._sort_ascending)
+        books = sort_tracks(self._filter(self._audiobook_tracks, query), self._membership,
+                            self._sort_field, self._sort_ascending)
+        populate_track_list(self.songs_list, music, self._membership)
+        populate_track_list(self.audiobooks_list, books, self._membership)
+        self._shown = {"songs": len(music), "audiobooks": len(books)}
+        if emit_header:
+            self._emit_header()
 
     def _filter(self, tracks, query: str):
         if not query:
@@ -1934,6 +2003,8 @@ class LibraryView(QWidget):
         self.duplicates_list.clear()
         self.unsorted_list.clear()
         self._counts.update(songs=0, audiobooks=0, duplicates=0, unsorted=0, playtime="", series=0)
+        self._music_tracks, self._audiobook_tracks, self._membership = [], [], {}
+        self._shown = {"songs": 0, "audiobooks": 0}
 
     # ---- actions ----
 
@@ -2129,6 +2200,7 @@ class LibraryView(QWidget):
         dupe_ids = [self.duplicates_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(start, count)]
 
         changed = False
+        decision: dict = {}  # "delete permanently?" is asked at most once for the whole pass
         for index, dupe_id in enumerate(dupe_ids, start=1):
             conn = libdb.open_db(library_root)
             dupe_row = conn.execute(
@@ -2148,7 +2220,7 @@ class LibraryView(QWidget):
             if not dialog.exec():
                 break  # STOP / window closed
             if dialog.action == "keep":
-                if not self._resolve_dupe(dialog.keep_id, dialog.remove_id, refresh=False):
+                if not self._resolve_dupe(dialog.keep_id, dialog.remove_id, refresh=False, decision=decision):
                     break  # file in use — warning already shown, don't keep going
                 changed = True
             elif dialog.action == "dismiss":
@@ -2181,8 +2253,10 @@ class LibraryView(QWidget):
         if not dialog.exec() or not dialog.plan:
             return
         resolved, in_use = 0, []
+        decision: dict = {}  # "delete permanently?" is asked at most once for the whole pass
         for entry in dialog.plan:
-            if self._resolve_dupe(entry["keep"]["id"], entry["remove"]["id"], refresh=False, warn=False):
+            if self._resolve_dupe(entry["keep"]["id"], entry["remove"]["id"], refresh=False, warn=False,
+                                  decision=decision):
                 resolved += 1
             else:
                 in_use.append(entry["remove"]["library_path"])
@@ -2190,26 +2264,31 @@ class LibraryView(QWidget):
         message = f"Resolved {resolved} duplicate pair(s)."
         remaining = self.duplicates_list.count()
         if remaining:
-            message += f"\n\n{remaining} pair(s) still need a look — use RESOLVE... for those."
+            message += f"\n\n{remaining} pair(s) still need a look. Use Resolve… for those."
         if in_use:
-            message += ("\n\nThese files are in use by another program and were left alone "
-                        "(nothing changed for them):\n\n" + "\n".join(in_use))
+            message += ("\n\nThese files couldn't be removed and were left alone (nothing "
+                        "changed for them):\n\n" + "\n".join(in_use))
         QMessageBox.information(self, "Auto-resolve finished", message)
 
-    def _resolve_dupe(self, keep_id: int, remove_id: int, refresh: bool = True, warn: bool = True) -> bool:
+    def _resolve_dupe(self, keep_id: int, remove_id: int, refresh: bool = True, warn: bool = True,
+                      decision: dict | None = None) -> bool:
+        """Moves the removed copy to the Trash and points its playlist
+        entries at the kept one. `decision` is shared across a whole
+        resolve/auto-resolve pass (see remove_files)."""
         library_root = self._get_library_root()
         conn = libdb.open_db(library_root)
         row = conn.execute("SELECT library_path FROM tracks WHERE id = ?", (remove_id,)).fetchone()
         if row:
-            error = _try_unlink(Path(library_root) / row["library_path"])
+            path = Path(library_root) / row["library_path"]
+            error = remove_files(self, [path], decision)[path]
             if error:
                 conn.close()
                 if not warn:
                     return False
                 QMessageBox.warning(
                     self, "Couldn't resolve",
-                    "That file is currently in use by another program and can't be removed yet — "
-                    "close whatever has it open and try again. Nothing was changed.",
+                    "That file couldn't be removed (it may be open in another program, or you chose "
+                    "not to delete it permanently). Nothing was changed.",
                 )
                 return False
         affected_playlist_ids = libdb.playlists_containing_track(conn, remove_id)

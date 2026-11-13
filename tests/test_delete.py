@@ -76,11 +76,65 @@ def test_series_page_delete_last_book_goes_back(qtbot, library, answer_dialogs):
     assert not (library.root / "Audiobooks/Duo").exists()
 
 
-def test_locked_file_is_reported_not_deleted(qtbot, library, answer_dialogs, monkeypatch):
-    monkeypatch.setattr(lv, "_try_unlink", lambda path: "in use")
+def test_delete_goes_to_trash(qtbot, library, answer_dialogs, fake_trash):
+    path = library.root / "Music/Band/LP/01 One.mp3"
     n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
-    assert n == 0
-    assert answer_dialogs["messages"] and "couldn't be deleted" in answer_dialogs["messages"][0][0]
+    assert n == 1 and not path.exists()
+    assert [p.name for p in fake_trash.iterdir()] == ["0-01 One.mp3"]
+
+
+def _no_trash(monkeypatch):
+    def fail(path):
+        raise OSError("no trash on this drive")
+    monkeypatch.setattr(lv, "send2trash", fail)
+
+
+def test_no_trash_and_user_declines_keeps_file(qtbot, library, answer_dialogs, monkeypatch):
+    _no_trash(monkeypatch)
+    asked = []
+    yes, no = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+    # first question: "Delete from library?" -> Yes; second: "delete permanently?" -> No
+    answers = iter([yes, no])
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: (asked.append(a[1]), next(answers))[1]))
+    path = library.root / "Music/Band/LP/01 One.mp3"
+    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    assert n == 0 and path.exists()
+    assert asked == ["Delete from library", "Can't use the Trash"]
+    assert answer_dialogs["messages"] and "left in your library" in answer_dialogs["messages"][0][0]
     conn = libdb.open_db(str(library.root))
     assert conn.execute("SELECT 1 FROM tracks WHERE id = ?", (library.ids["one"],)).fetchone()
     conn.close()
+
+
+def test_no_trash_and_user_accepts_deletes_permanently(qtbot, library, answer_dialogs, monkeypatch):
+    _no_trash(monkeypatch)
+    tracks = [(library.ids["one"], "Music/Band/LP/01 One.mp3"), (library.ids["two"], "Music/Band/LP/02 Two.mp3")]
+    n = lv.delete_library_tracks(None, str(library.root), tracks)
+    assert n == 2 and not (library.root / "Music/Band").exists()
+
+
+def test_locked_file_is_reported_not_deleted(qtbot, library, answer_dialogs, monkeypatch):
+    _no_trash(monkeypatch)
+    monkeypatch.setattr(lv, "_try_unlink", lambda path: "in use")
+    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    assert n == 0
+    assert "left in your library" in answer_dialogs["messages"][0][0]
+    conn = libdb.open_db(str(library.root))
+    assert conn.execute("SELECT 1 FROM tracks WHERE id = ?", (library.ids["one"],)).fetchone()
+    conn.close()
+
+
+def test_permanent_question_asked_once_per_operation(qtbot, tmp_path, monkeypatch):
+    _no_trash(monkeypatch)
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: (asked.append(1), QMessageBox.StandardButton.Yes)[1]))
+    files = []
+    for i in range(3):
+        f = tmp_path / f"{i}.mp3"
+        f.write_bytes(b"x")
+        files.append(f)
+    decision = {}
+    for f in files:  # one file per call, like auto-resolve does
+        assert lv.remove_files(None, [f], decision)[f] is None
+    assert len(asked) == 1 and not any(f.exists() for f in files)

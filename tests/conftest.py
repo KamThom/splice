@@ -152,3 +152,19 @@ def window(qtbot, qapp, library, tmp_path, monkeypatch, answer_dialogs):
     w.show()
     qtbot.wait(450)  # let the startup timers (output folder, queue restore) run
     return w
+
+
+@pytest.fixture(autouse=True)
+def fake_trash(tmp_path, monkeypatch):
+    """Every test gets its own fake Trash folder — deletes in tests must
+    never land in your real system Trash."""
+    import splice.library_view as lv
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+
+    def move_to_fake_trash(path):
+        src = Path(path)
+        shutil.move(str(src), str(trash / f"{len(list(trash.iterdir()))}-{src.name}"))
+
+    monkeypatch.setattr(lv, "send2trash", move_to_fake_trash)
+    return trash

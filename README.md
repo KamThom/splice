@@ -134,8 +134,10 @@ python -m pytest
 ```
 
 They cover navigation (sidebar, top bar, tool drawer, log), deleting
-(songs, whole series, single books, cancel, locked files), duplicate review and
-auto-resolve, drag-and-drop into Merge/Tags, and the table helpers.
+(songs, whole series, single books, cancel, locked files, the Trash and its
+permanent-delete fallback), duplicate review and auto-resolve, drag-and-drop
+into Merge/Tags and onto playlists, the remembered output folder, search, and
+the table helpers. Deletes in tests go to a fake Trash folder, never yours.
 
 ## Finding your way around
 
@@ -159,6 +161,9 @@ auto-resolve, drag-and-drop into Merge/Tags, and the table helpers.
 - **Drag songs or audiobooks** from a list straight onto the Merge list, the
   Split drop area or the Tags batch list. These drags only ever copy — a file
   can't be moved out of your library by dragging it.
+- **Drag songs onto a playlist in the sidebar** to add them — the playlist
+  lights up as you hover it. Songs already on it aren't added twice, and the
+  **Log** button briefly confirms ("Added 3 songs to Mix").
 
 ## Library
 
@@ -184,7 +189,8 @@ sources…** to build it from folders you already have:
 
 **Songs** is a table of Title / Artist / Album / Added / Time, plus **In** — how
 many playlists a track is in (click that number to jump to one of them). The
-search box filters by title, artist or album. Select songs to **Add to
+search box filters by title, artist or album as you type (the subtitle shows
+how many match). Select songs to **Add to
 playlist…**, **Edit tags**, **Copy…** them somewhere, or **Delete…** them.
 
 **Audiobooks** opens on a shelf of covers, one per series plus one per book
@@ -205,11 +211,20 @@ rewrites the playlist's `.m3u8` immediately.
 
 ### Deleting
 
-Every delete asks first and says what's about to go. It removes Splice's copy
-only — your original source folders are never touched — but it can't be undone.
+Every delete asks first and says what's about to go. Deleted files go to your
+system **Trash**, so a mistake can be undone from your file manager. It
+removes Splice's copy only — your original source folders are never touched.
 Playlists that held a deleted song are updated, and folders the delete leaves
-empty (an artist/album or series folder) are cleaned up. A file that's open in
-another program is left alone and listed afterwards.
+empty (an artist/album or series folder) are cleaned up. Resolving duplicates
+uses the Trash too.
+
+Some drives (or file systems) don't allow a Trash folder. If a file can't be
+moved there, Splice asks once — per delete, not per file — whether to delete
+those permanently instead; say no and they stay in your library. A file that's
+open in another program is left alone and listed afterwards.
+
+Restoring a file from the Trash puts it back in the library folder, but not in
+Splice's index; add it again with **⋯ → Add files…**.
 
 ### Cleanup: Duplicates, Unsorted, Health
 
@@ -255,8 +270,11 @@ only ever writes into the destination you pick.
 ## Tools
 
 **Output folder** — Merge, Split and YouTube save into an output folder. Splice
-asks for it when it starts (starting from your last choice); change it any time
-from **Output → Choose folder…**, or open it with **Output → Open folder**.
+asks for it the first time one of them needs it and remembers it from then on.
+It only asks again if that folder has gone missing (say, an unplugged drive);
+YouTube downloads resumed at launch wait, rather than download nowhere, until a
+folder is chosen. Change it any time from **Output → Choose folder…**, or open
+it with **Output → Open folder**.
 
 Every drop target in the tools (the Merge list, the Split zone, the Tags batch
 list) also opens a file picker if you click its empty space instead of dragging.

@@ -1,5 +1,6 @@
 """Reusable Qt widgets: drop zones, status indicator, file picker, cover art thumbnail, level gauge."""
 
+import json
 import re
 from pathlib import Path
 
@@ -38,6 +39,9 @@ from PyQt6.QtWidgets import (
 )
 
 from .styles import ACCENT, AMBER, BORDER, CONSOLE, DISPLAY_FONT_FAMILY, GREEN, INK, MUTED, ON_ACCENT, RED, SUNSET, SURFACE
+
+
+TRACK_IDS_MIME = "application/x-splice-track-ids"  # JSON list of track ids, set by TrackListWidget drags
 
 
 def extract_dropped_mp3s(event) -> list[str]:
@@ -1077,12 +1081,17 @@ class TrackListWidget(QListWidget):
         data = super().mimeData(items)
         root = self.library_root_getter() if self.library_root_getter else None
         if root and self.dragDropMode() == QAbstractItemView.DragDropMode.DragOnly:
-            urls = []
+            urls, ids = [], []
             for item in items:
                 info = item.data(Qt.ItemDataRole.UserRole) or {}
                 if info.get("library_path"):
                     urls.append(QUrl.fromLocalFile(str(Path(root) / info["library_path"])))
+                if info.get("id") is not None:
+                    ids.append(int(info["id"]))
             data.setUrls(urls)
+            # Track ids too, so a drop on a sidebar playlist can add them
+            # directly (file paths alone would need a lookup per file).
+            data.setData(TRACK_IDS_MIME, json.dumps(ids).encode())
         return data
 
     def startDrag(self, supported_actions):
@@ -1271,8 +1280,23 @@ class LogButton(QPushButton):
     def set_expanded(self, expanded: bool):
         self.setChecked(expanded)
 
+    def flash(self, text: str, ms: int = 4000):
+        """Shows a short confirmation ("Added 3 songs to Mix") on the button
+        for a few seconds, then goes back to normal."""
+        self._flash_text = text
+        self._refresh()
+        if not hasattr(self, "_flash_timer"):
+            self._flash_timer = QTimer(self)
+            self._flash_timer.setSingleShot(True)
+            self._flash_timer.timeout.connect(self._end_flash)
+        self._flash_timer.start(ms)
+
+    def _end_flash(self):
+        self._flash_text = ""
+        self._refresh()
+
     def _refresh(self):
-        self.setText(self._task_text or "Log")
+        self.setText(getattr(self, "_flash_text", "") or self._task_text or "Log")
         tip = f"Status: {self._status_text}"
         if self._task_text:
             tip += f"\n{self._task_text}"

@@ -5,6 +5,8 @@ compact now-playing player. Tools (Merge/Split/YouTube/Tags) deliberately
 don't live here — they're in MainWindow's top bar — so the sidebar stays
 about browsing your music."""
 
+import json
+
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
@@ -19,7 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .styles import ACCENT, MUTED
-from .widgets import DisplayLabel, SunsetStripe, render_rounded_pixmap
+from .widgets import TRACK_IDS_MIME, DisplayLabel, SunsetStripe, render_rounded_pixmap
 
 # (kind, label) for the main browse sections and the cleanup chips — the
 # kind strings are what Sidebar.navigate emits and MainWindow routes on.
@@ -75,6 +77,74 @@ class NavButton(QPushButton):
         return QSize(160, 34)
 
 
+class PlaylistDropList(QListWidget):
+    """The sidebar's playlist list, which also accepts songs dragged from a
+    library table: hovering a playlist highlights it, dropping emits
+    tracksDropped(playlist_id, track_ids). Highlighting borrows the list's
+    current item and puts the real one back when the drag ends."""
+
+    tracksDropped = pyqtSignal(int, list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(False)
+        self._restore_item = None
+        self._dragging = False
+
+    def _ids(self, event) -> list[int]:
+        if not event.mimeData().hasFormat(TRACK_IDS_MIME):
+            return []
+        try:
+            return [int(i) for i in json.loads(bytes(event.mimeData().data(TRACK_IDS_MIME)).decode())]
+        except (ValueError, TypeError):
+            return []
+
+    def _start(self):
+        if not self._dragging:
+            self._dragging = True
+            current = self.currentItem()
+            self._restore_item = current if current is not None and current.isSelected() else None
+
+    def _end(self):
+        self._dragging = False
+        self.clearSelection()
+        if self._restore_item is not None:
+            self.setCurrentItem(self._restore_item)
+        self._restore_item = None
+
+    def dragEnterEvent(self, event):
+        if self._ids(event):
+            self._start()
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        if item is not None and self._ids(event):
+            self.setCurrentItem(item)
+            event.acceptProposedAction()
+        else:
+            self.clearSelection()
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._end()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        item = self.itemAt(event.position().toPoint())
+        ids = self._ids(event)
+        self._end()
+        if item is None or not ids:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.tracksDropped.emit(item.data(Qt.ItemDataRole.UserRole), ids)
+
+
 class PlaylistDeck(QWidget):
     """Emits navigate("playlist", (playlist_id, name)) on selection,
     createRequested when the "+" button is clicked, and renameRequested when
@@ -86,6 +156,7 @@ class PlaylistDeck(QWidget):
     navigate = pyqtSignal(str, object)
     createRequested = pyqtSignal()
     renameRequested = pyqtSignal(int, str)
+    tracksDropped = pyqtSignal(int, list)  # playlist_id, track ids dropped onto it
 
     THUMB_SIZE = 26
     THUMB_RADIUS = 6
@@ -109,8 +180,9 @@ class PlaylistDeck(QWidget):
         header_row.addWidget(add_btn)
         layout.addLayout(header_row)
 
-        self.playlist_list = QListWidget()
+        self.playlist_list = PlaylistDropList()
         self.playlist_list.setObjectName("sidebarList")
+        self.playlist_list.tracksDropped.connect(self.tracksDropped.emit)
         self.playlist_list.setIconSize(QSize(self.THUMB_SIZE, self.THUMB_SIZE))
         self.playlist_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.playlist_list.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -174,6 +246,7 @@ class Sidebar(QWidget):
     navigate = pyqtSignal(str, object)
     createRequested = pyqtSignal()
     renameRequested = pyqtSignal(int, str)
+    tracksDropped = pyqtSignal(int, list)  # playlist_id, track ids — songs dropped onto a playlist
 
     WIDTH = 244
 
@@ -211,6 +284,7 @@ class Sidebar(QWidget):
         self.playlist_deck.navigate.connect(self._on_playlist_navigate)
         self.playlist_deck.createRequested.connect(self.createRequested.emit)
         self.playlist_deck.renameRequested.connect(self.renameRequested.emit)
+        self.playlist_deck.tracksDropped.connect(self.tracksDropped.emit)
         layout.addWidget(self.playlist_deck, stretch=1)
 
         self._player_slot = QVBoxLayout()

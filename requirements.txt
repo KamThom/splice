@@ -2,3 +2,4 @@ PyQt6
 yt-dlp[default,deno]
 mutagen
 blake3
+send2trash

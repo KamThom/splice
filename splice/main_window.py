@@ -219,7 +219,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = QSettings("Thomas", "Splice")
-        self.output_dir = None
+        # Remembered across launches; only asked for again if it's missing
+        # or the folder has since been deleted/unmounted (_ensure_output_dir).
+        saved_output = str(self.settings.value("output_dir", "") or "")
+        self.output_dir = saved_output if saved_output and Path(saved_output).is_dir() else None
         self.library_root = str(self.settings.value("library_root", "") or "") or None
         self._pending_library_refile = None
         self.active_worker = None
@@ -258,6 +261,7 @@ class MainWindow(QMainWindow):
         self.sidebar.navigate.connect(self._on_navigate)
         self.sidebar.createRequested.connect(self._create_playlist)
         self.sidebar.renameRequested.connect(self._rename_playlist)
+        self.sidebar.tracksDropped.connect(self._add_dropped_tracks_to_playlist)
         self.now_playing_bar = NowPlayingBar()
         self.now_playing_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.sidebar.set_player(self.now_playing_bar)
@@ -515,6 +519,54 @@ class MainWindow(QMainWindow):
         libdb.get_or_create_playlist(conn, name.strip())
         conn.close()
         self._refresh_sidebar_playlists()
+
+    def _add_dropped_tracks_to_playlist(self, playlist_id: int, track_ids: list):
+        """Songs dragged from a library table onto a sidebar playlist.
+        Playlists are music-only, so audiobooks are skipped; songs already
+        on the playlist aren't added twice. Confirms on the Log button
+        rather than with a popup, so dragging several batches stays quick."""
+        if not self.library_root:
+            return
+        from .library.playlists import write_m3u8
+        conn = libdb.open_db(self.library_root)
+        prow = conn.execute("SELECT name FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+        if prow is None:
+            conn.close()
+            return
+        existing = libdb.playlist_track_ids(conn, playlist_id)
+        added = skipped_books = 0
+        for track_id in track_ids:
+            row = conn.execute("SELECT kind FROM tracks WHERE id = ?", (track_id,)).fetchone()
+            if row is None:
+                continue
+            if row["kind"] != "music":
+                skipped_books += 1
+                continue
+            if track_id in existing:
+                continue
+            libdb.add_playlist_track(conn, playlist_id, track_id, libdb.next_playlist_position(conn, playlist_id))
+            existing.add(track_id)
+            added += 1
+        if added:
+            write_m3u8(str(Path(self.library_root) / "Playlists"), prow["name"],
+                       libdb.playlist_track_paths_in_order(conn, playlist_id), self.library_root)
+        conn.close()
+
+        name = prow["name"]
+        if added:
+            message = f"Added {added} song{'' if added == 1 else 's'} to {name}"
+        elif skipped_books:
+            message = "Playlists are for songs. Audiobooks weren't added"
+        else:
+            message = f"Already on {name}"
+        self._set_status("done" if added else "standby", message)
+        self.console_strip.flash(message)
+        self._write_log(f"[{ts()}] {message}")
+        if added:
+            self._refresh_sidebar_playlists()  # cover mosaic may change
+            self.page_library.refresh()  # "In" counts
+            if self.content_stack.currentWidget() is self.page_playlist and self.page_playlist._playlist_id == playlist_id:
+                self.page_playlist.refresh()
 
     def _rename_playlist(self, playlist_id: int, new_name: str):
         if not self.library_root:
@@ -1147,6 +1199,7 @@ class MainWindow(QMainWindow):
             self.output_dir = chosen
             self.settings.setValue("output_dir", chosen)
             self._refresh_output_label()
+            self._pump_youtube_queue()  # un-pauses a queue that was waiting on a folder
 
     def _open_output_dir(self):
         if not self.output_dir:
@@ -1185,6 +1238,16 @@ class MainWindow(QMainWindow):
         # existing library never starts on a fresh launch (same reason
         # _refresh_sidebar_playlists() needs its own explicit call too).
         self._kick_off_loudness_analysis()
+
+    def _ensure_output_dir(self) -> bool:
+        """True once there's a usable output folder: the remembered one if it
+        still exists, otherwise ask (pre-filled with the last choice). False
+        if the user cancels — callers abort whatever needed the folder."""
+        if self.output_dir and Path(self.output_dir).is_dir():
+            return True
+        self.output_dir = self._prompt_for_output_dir()
+        self._refresh_output_label()
+        return bool(self.output_dir)
 
     def _prompt_for_output_dir(self) -> str | None:
         """Cancel-friendly: returns None if the user backs out instead of forcing
@@ -1239,11 +1302,8 @@ class MainWindow(QMainWindow):
             self.merge_list.takeItem(self.merge_list.row(item))
 
     def _run_merge(self):
-        if not self.output_dir:
-            self.output_dir = self._prompt_for_output_dir()
-            self._refresh_output_label()
-            if not self.output_dir:
-                return
+        if not self._ensure_output_dir():
+            return
         files = self.merge_list.paths()
         if len(files) < 2:
             QMessageBox.warning(self, "Need at least 2 files", "Add two or more mp3 parts to merge.")
@@ -1293,11 +1353,8 @@ class MainWindow(QMainWindow):
     # ---- split behavior ----
 
     def _run_split(self, files: list[str]):
-        if not self.output_dir:
-            self.output_dir = self._prompt_for_output_dir()
-            self._refresh_output_label()
-            if not self.output_dir:
-                return
+        if not self._ensure_output_dir():
+            return
         segment_seconds = int(self.minutes_spin.value() * 60)
 
         self._split_estimates = []
@@ -1367,11 +1424,8 @@ class MainWindow(QMainWindow):
         if not text:
             QMessageBox.warning(self, "No URL", "Paste one or more YouTube URLs first.")
             return
-        if not self.output_dir:
-            self.output_dir = self._prompt_for_output_dir()
-            self._refresh_output_label()
-            if not self.output_dir:
-                return
+        if not self._ensure_output_dir():
+            return
 
         urls = [line.strip() for line in text.splitlines() if line.strip()]
         self.youtube_url_edit.clear()
@@ -1460,6 +1514,11 @@ class MainWindow(QMainWindow):
 
     def _pump_youtube_queue(self):
         if self.youtube_active_worker is None and self.youtube_queue_list.count() > 0:
+            if not self._ensure_output_dir():
+                # e.g. resuming last session's queue with no usable folder —
+                # keep everything queued rather than downloading to nowhere.
+                self.youtube_now_label.setText("Queue paused: choose an output folder (Output menu) to continue")
+                return
             item = self.youtube_queue_list.takeItem(0)
             data = item.data(Qt.ItemDataRole.UserRole)
             self._current_download_title = data["title"]
