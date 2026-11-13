@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import blake3
-from mutagen.id3 import ID3NoHeaderError
 from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3NoHeaderError
 from mutagen.mp3 import MP3
 
 from ..workers import probe_duration_seconds

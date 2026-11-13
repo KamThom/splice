@@ -1,16 +1,17 @@
 """Deleting from the library: songs, whole series, single books, cancel."""
 
-from pathlib import Path
 
 from PyQt6.QtWidgets import QMessageBox
 
-import splice.library_view as lv
+import splice.library_actions as actions
+import splice.views.library as library_view
+import splice.views.series as series_view
 from splice.library import db as libdb
 from splice.library.series_artwork import find_series_artwork
 
 
 def _view(library):
-    view = lv.LibraryView(lambda: str(library.root), lambda r: None)
+    view = library_view.LibraryView(lambda: str(library.root), lambda r: None)
     view.refresh()
     return view
 
@@ -57,12 +58,12 @@ def test_delete_series_removes_books_and_artwork(qtbot, library, answer_dialogs)
 
 def test_delete_standalone_with_absolute_path(qtbot, library, answer_dialogs):
     path = library.root / "Audiobooks/Lonely.mp3"
-    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["lonely"], str(path))], noun="audiobook")
+    n = actions.delete_library_tracks(None, str(library.root), [(library.ids["lonely"], str(path))], noun="audiobook")
     assert n == 1 and not path.exists()
 
 
 def test_series_page_delete_last_book_goes_back(qtbot, library, answer_dialogs):
-    page = lv.AudiobookSeriesView(lambda: str(library.root))
+    page = series_view.AudiobookSeriesView(lambda: str(library.root))
     back, changed = [], []
     page.backRequested.connect(lambda: back.append(True))
     page.libraryChanged.connect(lambda: changed.append(True))
@@ -78,7 +79,7 @@ def test_series_page_delete_last_book_goes_back(qtbot, library, answer_dialogs):
 
 def test_delete_goes_to_trash(qtbot, library, answer_dialogs, fake_trash):
     path = library.root / "Music/Band/LP/01 One.mp3"
-    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    n = actions.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
     assert n == 1 and not path.exists()
     assert [p.name for p in fake_trash.iterdir()] == ["0-01 One.mp3"]
 
@@ -86,7 +87,7 @@ def test_delete_goes_to_trash(qtbot, library, answer_dialogs, fake_trash):
 def _no_trash(monkeypatch):
     def fail(path):
         raise OSError("no trash on this drive")
-    monkeypatch.setattr(lv, "send2trash", fail)
+    monkeypatch.setattr(actions, "send2trash", fail)
 
 
 def test_no_trash_and_user_declines_keeps_file(qtbot, library, answer_dialogs, monkeypatch):
@@ -97,7 +98,7 @@ def test_no_trash_and_user_declines_keeps_file(qtbot, library, answer_dialogs, m
     answers = iter([yes, no])
     monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: (asked.append(a[1]), next(answers))[1]))
     path = library.root / "Music/Band/LP/01 One.mp3"
-    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    n = actions.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
     assert n == 0 and path.exists()
     assert asked == ["Delete from library", "Can't use the Trash"]
     assert answer_dialogs["messages"] and "left in your library" in answer_dialogs["messages"][0][0]
@@ -109,14 +110,14 @@ def test_no_trash_and_user_declines_keeps_file(qtbot, library, answer_dialogs, m
 def test_no_trash_and_user_accepts_deletes_permanently(qtbot, library, answer_dialogs, monkeypatch):
     _no_trash(monkeypatch)
     tracks = [(library.ids["one"], "Music/Band/LP/01 One.mp3"), (library.ids["two"], "Music/Band/LP/02 Two.mp3")]
-    n = lv.delete_library_tracks(None, str(library.root), tracks)
+    n = actions.delete_library_tracks(None, str(library.root), tracks)
     assert n == 2 and not (library.root / "Music/Band").exists()
 
 
 def test_locked_file_is_reported_not_deleted(qtbot, library, answer_dialogs, monkeypatch):
     _no_trash(monkeypatch)
-    monkeypatch.setattr(lv, "_try_unlink", lambda path: "in use")
-    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    monkeypatch.setattr(actions, "_try_unlink", lambda path: "in use")
+    n = actions.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
     assert n == 0
     assert "left in your library" in answer_dialogs["messages"][0][0]
     conn = libdb.open_db(str(library.root))
@@ -136,5 +137,5 @@ def test_permanent_question_asked_once_per_operation(qtbot, tmp_path, monkeypatc
         files.append(f)
     decision = {}
     for f in files:  # one file per call, like auto-resolve does
-        assert lv.remove_files(None, [f], decision)[f] is None
+        assert actions.remove_files(None, [f], decision)[f] is None
     assert len(asked) == 1 and not any(f.exists() for f in files)

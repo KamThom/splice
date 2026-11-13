@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Splice app icon: a retro striped sunset over the coral/amber/teal stripe from the logo.
+       No clipPath on purpose: Qt's SVG renderer (used for the window icon) ignores it. The
+       navy cut lines run across the sun and simply vanish against the navy background. -->
+  <defs>
+    <linearGradient id="sun-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F2B544"/>
+      <stop offset="1" stop-color="#FF6B5B"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#0F1420"/>
+  <circle cx="128" cy="120" r="72" fill="url(#sun-fill)"/>
+  <!-- the classic 70s horizontal cuts, widening toward the horizon -->
+  <rect x="48" y="128" width="160" height="5" fill="#0F1420"/>
+  <rect x="48" y="143" width="160" height="7" fill="#0F1420"/>
+  <rect x="48" y="160" width="160" height="9" fill="#0F1420"/>
+  <rect x="48" y="179" width="160" height="14" fill="#0F1420"/>
+  <rect x="56" y="206" width="44" height="10" rx="5" fill="#FF6B5B"/>
+  <rect x="106" y="206" width="44" height="10" rx="5" fill="#F2B544"/>
+  <rect x="156" y="206" width="44" height="10" rx="5" fill="#3FB6A8"/>
+</svg>

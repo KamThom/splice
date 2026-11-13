@@ -209,15 +209,6 @@ def music_total_duration_seconds(conn: sqlite3.Connection) -> float:
     return row["total"] or 0.0
 
 
-def music_unique_artist_count(conn: sqlite3.Connection) -> int:
-    """Distinct non-blank artists across music tracks. Unsorted tracks
-    routinely have a blank artist (that's usually why they're Unsorted), so
-    they're naturally excluded without a separate filter."""
-    row = conn.execute(
-        "SELECT COUNT(DISTINCT artist) AS n FROM tracks WHERE kind = 'music' AND artist IS NOT NULL AND trim(artist) != ''"
-    ).fetchone()
-    return row["n"] or 0
-
 
 def list_unresolved_fuzzy_dupes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM fuzzy_dupes WHERE resolved = 0").fetchall()

@@ -1,7 +1,7 @@
 """mutagen-based ID3 tag read/write helpers. No Qt dependency — independently testable."""
 
-from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 from mutagen.easyid3 import EasyID3
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 
 TEXT_FIELDS = ("title", "artist", "album", "date", "tracknumber")
 

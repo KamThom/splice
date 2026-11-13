@@ -7,7 +7,15 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QPoint, QSettings, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QKeySequence, QShortcut
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -39,10 +47,13 @@ from . import tagging
 from .library import db as libdb
 from .library.health import HealthScanWorker
 from .library.loudness import LoudnessAnalysisWorker
-from .library_view import AudiobookSeriesView, LibraryView, PlaylistView
 from .player import TrackPlayer
 from .sidebar import Sidebar
 from .styles import STYLESHEET, build_palette, load_bundled_fonts
+from .track_lists import playlist_mosaic_art
+from .views.library import LibraryView
+from .views.playlist import PlaylistView
+from .views.series import AudiobookSeriesView
 from .widgets import (
     ConsoleStrip,
     CoverArtThumbnail,
@@ -193,10 +204,9 @@ TOOL_PAGES = {
 LIBRARY_KINDS = ("songs", "audiobooks", "duplicates", "unsorted", "health")
 
 
-def tab_content(title: str) -> tuple[QWidget, QVBoxLayout]:
-    """Borderless content container for a tool page. `title` is kept for
-    readability at the call sites; the visible title comes from the top bar
-    (TOOL_PAGES)."""
+def tab_content() -> tuple[QWidget, QVBoxLayout]:
+    """Borderless content container for a tool page. The tool's title and
+    summary are shown by the drawer header (TOOL_PAGES), not the page."""
     widget = QWidget()
     layout = QVBoxLayout(widget)
     layout.setContentsMargins(0, 0, 0, 0)
@@ -346,7 +356,6 @@ class MainWindow(QMainWindow):
             self.sidebar.set_playlists([])
         else:
             from .library.playlists import find_playlist_artwork
-            from .library_view import playlist_mosaic_art
             conn = libdb.open_db(self.library_root)
             rows = libdb.list_playlists(conn)
             playlists = []
@@ -779,7 +788,7 @@ class MainWindow(QMainWindow):
         self.output_settings_btn.setToolTip(text)
 
     def _build_merge_panel(self):
-        widget, layout = tab_content("MERGE MODULE — combine multi-part audiobooks")
+        widget, layout = tab_content()
 
         hint = QLabel("Drag mp3s in, or click empty space in the list to browse — then drag to reorder. "
                       "Output is stream-copied (re-encodes only if formats mismatch).")
@@ -847,7 +856,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _build_split_panel(self):
-        widget, layout = tab_content("SPLIT MODULE — chop into fixed-length segments")
+        widget, layout = tab_content()
 
         settings_row = QHBoxLayout()
         seg_label = QLabel("Segment length:")
@@ -883,7 +892,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _build_youtube_panel(self):
-        widget, layout = tab_content("YOUTUBE MODULE — download and convert to mp3")
+        widget, layout = tab_content()
 
         hint = QLabel("Paste one or more YouTube URLs, one per line — single videos or playlist links both "
                        "work (playlists expand into every video). Everything queues up, so you can keep "
@@ -981,7 +990,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _build_metadata_panel(self):
-        widget, layout = tab_content("TAGS MODULE — edit ID3 metadata (title, artist, album, year, art)")
+        widget, layout = tab_content()
 
         self.tag_mode_tabs = QTabWidget()
         self.tag_mode_tabs.addTab(self._build_single_tag_panel(), "Single file")
@@ -1838,8 +1847,17 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
 
 
+APP_ICON = Path(__file__).parent / "assets" / "icon.svg"
+
+
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName("Splice")
+    # Matches the splice.desktop launcher install-linux.sh writes, so GNOME's
+    # dock/overview shows the Splice icon for the running window (on Wayland
+    # this becomes the window's app_id).
+    app.setDesktopFileName("splice")
+    app.setWindowIcon(QIcon(str(APP_ICON)))
     app.setStyle("Fusion")  # ensures the stylesheet renders consistently instead of
     # fighting the native macOS/Windows widget chrome (source of stray bezel artifacts)
     load_bundled_fonts()

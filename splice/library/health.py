@@ -3,7 +3,7 @@ file read per track (like loudness measurement), so it gets the same
 background-QThread-sweep-with-cached-column treatment as
 splice/library/loudness.py. The other dashboard categories (missing tags,
 duplicates, missing files, orphaned files) are cheap enough to compute live
-from the DB/filesystem in library_view.py and don't need a worker."""
+from the DB/filesystem in views/library.py and don't need a worker."""
 
 from pathlib import Path
 

@@ -4,14 +4,27 @@ import json
 import re
 from pathlib import Path
 
-from PyQt6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import (
+    QBuffer,
+    QEvent,
+    QIODevice,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
-    QIcon,
     QFont,
     QFontMetrics,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -38,8 +51,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .styles import ACCENT, AMBER, BORDER, CONSOLE, DISPLAY_FONT_FAMILY, GREEN, INK, MUTED, ON_ACCENT, RED, SUNSET, SURFACE
-
+from .styles import (
+    ACCENT,
+    AMBER,
+    BORDER,
+    CONSOLE,
+    DISPLAY_FONT_FAMILY,
+    GREEN,
+    INK,
+    MUTED,
+    ON_ACCENT,
+    RED,
+    SUNSET,
+    SURFACE,
+)
 
 TRACK_IDS_MIME = "application/x-splice-track-ids"  # JSON list of track ids, set by TrackListWidget drags
 
@@ -437,12 +462,10 @@ class DisplayLabel(QLabel):
     lettering used for chrome/branding (logo, page and section headings).
     Actual data (track titles, artist names, ...) stays in the body font so
     it's legible. Righteous is registered with Qt via
-    styles.load_bundled_fonts() at startup. It only ships one weight, so
-    `bold` is accepted for call-site compatibility but ignored — asking Qt
-    to fake-bold it just smears the letterforms."""
+    styles.load_bundled_fonts() at startup. It only ships one weight —
+    never ask Qt to fake-bold it, that just smears the letterforms."""
 
-    def __init__(self, text: str = "", point_size: int = 13, color: str = INK,
-                 bold: bool = True, letter_spacing: int = 1):
+    def __init__(self, text: str = "", point_size: int = 13, color: str = INK, letter_spacing: int = 1):
         super().__init__(text)
         # letter-spacing has no QSS equivalent, so it has to come from a
         # QFont via setFont() — but font-family/size from setFont() get
@@ -483,11 +506,9 @@ class SunsetStripe(QWidget):
 class RoundedFrame(QFrame):
     """A panel with rounded corners, painted by hand (background + border)
     so it can sit anywhere regardless of what the stylesheet says about
-    plain QFrames. `radius` sets the corner size; `corner` is accepted for
-    call-site compatibility with the old chamfered shape and ignored."""
+    plain QFrames. `radius` sets the corner size."""
 
-    def __init__(self, radius: int = 14, corner: str = "bottom-left",
-                 background: str = SURFACE, border: str = BORDER):
+    def __init__(self, radius: int = 14, background: str = SURFACE, border: str = BORDER):
         super().__init__()
         self._radius = radius
         self._background = QColor(background)
@@ -1231,8 +1252,8 @@ class TrackColumnHeader(QWidget):
 
 def _format_ms(ms: int) -> str:
     """M:SS for a player position/duration in milliseconds. Distinct from
-    library_view.py's _format_duration (that one formats DB seconds, and
-    library_view.py imports from this file, not the reverse)."""
+    track_lists.py's _format_duration (that one formats DB seconds, and
+    track_lists.py imports from this file, not the reverse)."""
     total_seconds = max(0, int(ms // 1000))
     return f"{total_seconds // 60}:{total_seconds % 60:02d}"
 

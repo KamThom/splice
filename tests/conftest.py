@@ -158,7 +158,7 @@ def window(qtbot, qapp, library, tmp_path, monkeypatch, answer_dialogs):
 def fake_trash(tmp_path, monkeypatch):
     """Every test gets its own fake Trash folder — deletes in tests must
     never land in your real system Trash."""
-    import splice.library_view as lv
+    import splice.library_actions as actions
     trash = tmp_path / "Trash"
     trash.mkdir()
 
@@ -166,5 +166,5 @@ def fake_trash(tmp_path, monkeypatch):
         src = Path(path)
         shutil.move(str(src), str(trash / f"{len(list(trash.iterdir()))}-{src.name}"))
 
-    monkeypatch.setattr(lv, "send2trash", move_to_fake_trash)
+    monkeypatch.setattr(actions, "send2trash", move_to_fake_trash)
     return trash

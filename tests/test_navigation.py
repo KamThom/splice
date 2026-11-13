@@ -1,6 +1,5 @@
 """Sidebar, top bar, tool drawer and log button — the redesigned shell."""
 
-from pathlib import Path
 
 from PyQt6.QtWidgets import QListWidgetItem
 

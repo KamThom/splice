@@ -1,0 +1,8 @@
+# Lint with:  ruff check .     (auto-fix what it can:  ruff check --fix .)
+line-length = 120
+target-version = "py310"
+
+[lint]
+# F: unused imports/variables, undefined names (what pyflakes caught)
+# I: import sorting
+select = ["F", "I"]

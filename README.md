@@ -87,20 +87,18 @@ After the one-time setup above (venv created, requirements installed):
 If you created the venv while VS Code was already open, run **Developer:
 Reload Window** so it picks it up.
 
-**Optional: launcher icon.** To start Splice from your app menu, create
-`~/.local/share/applications/splice.desktop` (replace `/path/to/splice` with
-the real path):
+**Add Splice to your app menu.** Run the installer once from the project
+folder:
 
-```ini
-[Desktop Entry]
-Type=Application
-Name=Splice
-Comment=Organize, merge, split, download and tag mp3s
-Exec=/path/to/splice/.venv/bin/python /path/to/splice/splice.py
-Path=/path/to/splice
-Terminal=false
-Categories=AudioVideo;Audio;
+```bash
+./install-linux.sh
 ```
+
+It sets up `.venv` if it isn't there yet, then adds a **Splice** entry with its
+icon to your app menu (GNOME, KDE, and other freedesktop desktops), all under
+`~/.local/share`, so no `sudo`. The running window shows the Splice icon in the
+dock too. Run it again if you move the project folder; remove it with
+`./install-linux.sh --uninstall`.
 
 **Troubleshooting**
 
@@ -132,6 +130,9 @@ They need ffmpeg on your PATH to make test audio.
 pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+`ruff check .` lints the code (unused imports, undefined names, import order;
+settings in `ruff.toml`), and `ruff check --fix .` fixes what it can.
 
 They cover navigation (sidebar, top bar, tool drawer, log), deleting
 (songs, whole series, single books, cancel, locked files, the Trash and its
@@ -339,17 +340,24 @@ checking artwork) show their progress on the button itself.
 
 `splice.py` is a thin entry point — the app itself lives in the `splice/` package:
 
-- `splice/styles.py` — the Midnight palette, fonts (Righteous + Barlow, bundled
-  in `splice/assets/fonts/`, SIL Open Font License) and the app-wide Qt stylesheet
-- `splice/sidebar.py` — the sidebar: library sections, cleanup chips, playlists,
-  and the slot for the mini player
 - `splice/main_window.py` — the window shell (sidebar, top bar, tool drawer, log)
   and the Merge/Split/YouTube/Tags tool behavior
-- `splice/library_view.py` — the Songs/Audiobooks/cleanup pages, the playlist and
-  audiobook series pages, the shared delete/selection/right-click helpers, and the
-  dialogs (Add sources, Add files, Export, duplicate review, track info)
-- `splice/widgets.py` — reusable widgets: the track table rows and column header,
-  progress meter, drop zones, artwork tiles, audiobook shelf, mini player, log button
+- `splice/sidebar.py` — the sidebar: library sections, cleanup chips, playlists
+  (including dropping songs onto them), and the slot for the mini player
+- `splice/views/` — the pages: `library.py` (Songs, Audiobooks, Duplicates,
+  Unsorted, Health), `playlist.py`, `series.py` (an audiobook series)
+- `splice/dialogs/` — `sources.py` (Add sources, Add files), `export.py`
+  (Export, Copy), `duplicates.py` (Resolve, Auto-resolve and its matching rules),
+  `tracks.py` (Track info, Add tracks, Add to playlist)
+- `splice/library_actions.py` — shared actions: deleting (to the Trash), the
+  "N selected" bar, right-click menus
+- `splice/track_lists.py` — table columns, sorting, filling track lists, and
+  time/size/date formatting
+- `splice/widgets.py` — reusable widgets: track rows and column header, progress
+  meter, drop zones, artwork tiles, audiobook shelf, mini player, log button
+- `splice/styles.py` — the Midnight palette, fonts and the app-wide Qt stylesheet
+- `splice/assets/` — bundled fonts (Righteous + Barlow, SIL Open Font License)
+  and the app icon
 - `splice/workers.py` — background `QThread` workers that shell out to ffmpeg/ffprobe/yt-dlp
 - `splice/player.py` — in-app playback
 - `splice/tagging.py` — `mutagen`-based ID3 read/write helpers (no Qt dependency)
@@ -359,3 +367,4 @@ checking artwork) show their progress on the button itself.
   `export.py` (device-export worker), `loudness.py` and `health.py` (background
   library checks), `series_artwork.py`
 - `tests/` — the pytest suite (see "Running the tests")
+- `install-linux.sh` — adds Splice to the Linux app menu
