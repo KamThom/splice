@@ -18,6 +18,8 @@ Requires Python 3.10+ and [ffmpeg](https://ffmpeg.org/).
 pip install -r requirements.txt
 ```
 
+(`requirements-dev.txt` adds pytest for the test suite.)
+
 **ffmpeg:**
 - macOS: `brew install ffmpeg`
 - Windows: `winget install ffmpeg` (or `choco install ffmpeg` / `scoop install ffmpeg`)
@@ -120,23 +122,48 @@ Categories=AudioVideo;Audio;
 - *YouTube downloads failing* — YouTube changes often; update yt-dlp inside the
   venv with `pip install -U "yt-dlp[default,deno]"`.
 
-## Project layout
+## Running the tests
 
-`splice.py` is a thin entry point — the app itself lives in the `splice/` package:
+The tests run headless (no window opens) against a small throwaway library
+they build in a temp folder; your real library and settings are never touched.
+They need ffmpeg on your PATH to make test audio.
 
-- `splice/styles.py` — palette constants and the app-wide Qt stylesheet
-- `splice/widgets.py` — reusable widgets (drop zones, file pickers, the level gauge, cover art thumbnail)
-- `splice/sidebar.py` — the left-hand navigation (Library/Search, Playlists, Tools)
-- `splice/workers.py` — background `QThread` workers that shell out to ffmpeg/ffprobe/yt-dlp
-- `splice/tagging.py` — `mutagen`-based ID3 read/write helpers (no Qt dependency)
-- `splice/library_view.py` — the Library home view, the ADD SOURCES migration wizard, and the EXPORT dialog
-- `splice/library/` — the library backend: `db.py` (SQLite index), `scanner.py` (read-only tag/duration/hash reads), `naming.py` (destination paths), `playlists.py` (`.m3u8` read/write), `migrate.py` (scan/build `QThread` workers), `export.py` (device-export `QThread` worker)
-- `splice/main_window.py` — the main window: sidebar/page wiring and the Merge/Split/YouTube/Tags tool behavior
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+They cover navigation (sidebar, top bar, tool drawer, log), deleting
+(songs, whole series, single books, cancel, locked files), duplicate review and
+auto-resolve, drag-and-drop into Merge/Tags, and the table helpers.
+
+## Finding your way around
+
+- **Sidebar (left)** — your music: **Songs** and **Audiobooks** with their
+  counts, small **Dupes / Unsorted / Health** chips for cleanup (a count turns
+  amber when something needs a look), your **Playlists** (**+** makes a new
+  one; double-click a name to rename it), and a compact player at the bottom.
+- **Top bar** — the page title and a one-line summary on the left. On the
+  right: **Merge**, **Split**, **YouTube** and **Tags**; **Log** (its dot shows
+  whether something's running); **⋯** for library-wide actions (Add sources,
+  Add files, Export, change the library folder); and **Output** for the
+  folder Merge/Split/YouTube save into.
+- **Tools open in a drawer** that slides over the right side of the window, so
+  the page you were on stays put. Click the tool's button again, the ✕, or
+  press **Esc** to close it — jobs keep running while it's closed, and the
+  YouTube button shows how many downloads are left (e.g. **YouTube 2**).
+- **Lists** are tables: click a column name to sort by it, click again to
+  reverse. Double-click a song to play it. The bar under each list shows how
+  many items are selected and what you can do with them; right-click any row
+  for the same actions.
+- **Drag songs or audiobooks** from a list straight onto the Merge list, the
+  Split drop area or the Tags batch list. These drags only ever copy — a file
+  can't be moved out of your library by dragging it.
 
 ## Library
 
-The app opens on the Library view. It starts empty — click **ADD SOURCES...** to
-build it from folders you already have:
+The app opens on **Songs**. A new library starts empty — open **⋯ → Add
+sources…** to build it from folders you already have:
 
 1. **Add music playlist folders** — one per existing playlist folder (monthly,
    themed, whatever). Mark exactly **one** as your master collection (e.g. a
@@ -147,124 +174,170 @@ build it from folders you already have:
 2. Optionally **set an audiobooks folder** — its existing structure (standalone
    files, or `Series Name/1_book_one.mp3`-style folders) is preserved exactly,
    no renaming.
-3. Click **SCAN** — read-only, hashes and reads tags for a preview (new tracks,
+3. Click **Scan** — read-only, hashes and reads tags for a preview (new tracks,
    exact duplicates, fuzzy matches, files landing in Unsorted) without writing
    anything. Safe to run as many times as you like.
-4. Click **BUILD LIBRARY** — copies files into `Library/Music/<Artist>/<Album>/`
+4. Click **Build library** — copies files into `Library/Music/<Artist>/<Album>/`
    or `Library/Audiobooks/...` and writes `.m3u8` playlists. Your original
    folders are never modified or deleted. Re-runnable later as your collection
    grows — already-migrated files (matched by content hash) are never re-copied.
 
+**Songs** is a table of Title / Artist / Album / Added / Time, plus **In** — how
+many playlists a track is in (click that number to jump to one of them). The
+search box filters by title, artist or album. Select songs to **Add to
+playlist…**, **Edit tags**, **Copy…** them somewhere, or **Delete…** them.
+
+**Audiobooks** opens on a shelf of covers, one per series plus one per book
+that isn't in a series; switch **View** to **All** for a table of every file.
+Click a series to open it — books are listed in series order, and clicking a
+book's cover plays it with the rest of the series queued after it. Hover over
+a cover for its **⋯** menu (or right-click it): a series has **Open** and
+**Delete series…**; a standalone book has **Play**, **Track info**, **Edit
+tags**, **Copy…** and **Delete…**. The series page's ⚙ menu also has **Delete
+series…**, and you can select books on it to delete just those.
+
+**Playlists** are fully editable: **Add tracks…** from the library, **Add
+files…** from disk, drag rows to reorder, and select tracks to **Edit tags**,
+**Copy…** or **Remove from playlist** (the song stays in your library). The ⚙
+menu has Export and Delete playlist. Click the cover to set the playlist's
+artwork; without one it shows a mosaic of its first few covers. Every change
+rewrites the playlist's `.m3u8` immediately.
+
+### Deleting
+
+Every delete asks first and says what's about to go. It removes Splice's copy
+only — your original source folders are never touched — but it can't be undone.
+Playlists that held a deleted song are updated, and folders the delete leaves
+empty (an artist/album or series folder) are cleaned up. A file that's open in
+another program is left alone and listed afterwards.
+
+### Cleanup: Duplicates, Unsorted, Health
+
 Duplicate handling is conservative on purpose: exact byte-identical files are
 auto-deduplicated (only one copy is ever kept), but anything less certain — same
 title/artist with different underlying bytes — is left as two separate tracks and
-flagged in the **Duplicates** tab for you to review; nothing is ever auto-merged.
-Click **RESOLVE...** to go through them one after another, starting at the
-selected pair (or the top): each pick (**KEEP THIS ONE**, **SKIP**, or **NOT A
-DUPLICATE**) opens the next pair right away, until the list ends or you click
-**STOP**.
+flagged under **Dupes** for you to review; nothing is ever auto-merged.
 
-For the common case — same song ripped twice — click **AUTO-RESOLVE...**
-instead. It picks out every pair with the same title and artist (ignoring
-case and spacing) whose lengths are within 5 seconds of each other, and keeps
-the larger file of each, usually the higher-bitrate copy. Tick **Only when the
-album matches too** to be stricter. You get a preview of exactly what will be
-kept and deleted before anything happens; playlist entries for a deleted copy
-move to the one kept. Anything that doesn't match (different titles, a live
-version with a different length, a missing file) stays in the list for
-**RESOLVE...**.
+- **Resolve…** goes through the pairs one after another, starting at the
+  selected pair (or the top). Each pick — **Keep this one**, **Skip**, or **Not
+  a duplicate** — opens the next pair right away, until the list ends or you
+  click **Stop**. Resize the window once and it stays that size.
+- **Auto-resolve…** handles the common case, the same song ripped twice. It
+  picks every pair with the same title and artist (ignoring case and spacing)
+  whose lengths are within 5 seconds of each other, and keeps the larger file of
+  each, usually the higher-bitrate copy. Tick **Only when the album matches
+  too** to be stricter. You see exactly what will be kept and deleted before
+  anything happens; playlist entries for a deleted copy move to the one kept.
+  Anything that doesn't match (different titles, a live version with a
+  different length, a missing file) stays in the list for **Resolve…**.
+
 Tracks with missing or unusable title/artist/album tags land in **Unsorted**
-instead of a guessed folder — select one and click **FIX TAGS** to jump straight
-to the Tags tool with it loaded.
-
-The **Songs** and **Audiobooks** tabs are a searchable, sortable table (search
-box up top filters by title/artist/album). The **In** column shows how many
-playlists a track belongs to. Playlists built by a migration appear in the
-sidebar — click one to see its contents (read-only for now; a full playlist
-editor is planned).
+instead of a guessed folder — select one and click **Fix tags** to open it in
+the Tags tool; saving re-files it into the library. **Health** counts missing
+tags, missing artwork, index entries whose file has gone missing, and files in
+the library folder Splice doesn't know about.
 
 ## Export
 
-Click **EXPORT...** (in the Library view, or on a playlist's page to
-preselect just that one) to copy playlists and/or audiobooks out to a device —
-a USB mass-storage MP3 player, an SD card, a staging folder for another
-library tool to import from, whatever. Check what you want, choose a
-destination folder, click **EXPORT**. Each selected item gets its own
-subfolder there: playlist tracks are copied with a zero-padded position prefix
-(`001 - Title.mp3`) so devices with no playlist support just play them in the
-right order by folder listing; audiobook folders are copied as-is, since their
-filenames already preserve series order. Re-exporting is additive by default;
-check **"Replace existing contents..."** to clear each item's destination
-subfolder first instead of accumulating old copies. Your library is never
-modified by an export — this only ever writes into the destination you pick.
+Open **⋯ → Export…** (or **Export…** from a playlist's ⚙ menu to preselect just
+that one) to copy playlists and/or audiobooks out to a device — a USB
+mass-storage MP3 player, an SD card, a staging folder for another library tool
+to import from, whatever. Check what you want, choose a destination folder,
+click **Export**. Each selected item gets its own subfolder there: playlist
+tracks are copied with a zero-padded position prefix (`001 - Title.mp3`) so
+devices with no playlist support just play them in the right order by folder
+listing; audiobook folders are copied as-is, since their filenames already
+preserve series order. Re-exporting is additive by default; check **"Replace
+existing contents..."** to clear each item's destination subfolder first instead
+of accumulating old copies. Your library is never modified by an export — this
+only ever writes into the destination you pick.
 
-**Output location** — Splice has no default output folder. On every launch it opens
-a folder picker asking where to save output (starting from your last choice, but you
-confirm each time); canceling re-prompts, since the app can't run without a location.
-Once chosen, it's also shown in the bar near the top of the window — click it any time
-during the session to change where files get saved.
+## Tools
 
-Every drop target in Splice (the Merge list, the Split zone, the Tags batch list)
-also opens a file picker if you click its empty space instead of dragging — use
-whichever's convenient. When you add several files at once (drag or picker),
-they're ordered naturally by filename (`Part 2` before `Part 10`), not
-alphabetically.
+**Output folder** — Merge, Split and YouTube save into an output folder. Splice
+asks for it when it starts (starting from your last choice); change it any time
+from **Output → Choose folder…**, or open it with **Output → Open folder**.
 
-Each module has its own progress gauge (a segmented meter, not a plain bar) and a
-CANCEL button once a job is running. Cancelling kills the job immediately and
-deletes whatever partial output it had produced — a half-merged file, in-progress
-split segments, or a partially downloaded/converted YouTube mp3. The gauge turns
-green with "COMPLETE" on success, red with "FAILED"/"CANCELLED" otherwise, and
-sweeps back and forth while a phase (like YouTube's mp3 conversion step) has no
-real percentage to report — so it's always clear whether something finished,
-failed, or is still working, without needing to check the console.
+Every drop target in the tools (the Merge list, the Split zone, the Tags batch
+list) also opens a file picker if you click its empty space instead of dragging.
+When you add several files at once they're ordered naturally by filename
+(`Part 2` before `Part 10`), not alphabetically.
 
-**Merge module** — drop two or more mp3 parts of the same audiobook (in order, or
-drag within the list to reorder), then click MERGE. A dialog asks for the output
-file name (pre-filled with `<first file>_merged`, editable or replaceable
-entirely); confirm to merge, or cancel to back out. Uses a fast stream copy; if
+Each tool has its own progress meter. It fills teal → amber → coral as a job
+runs, turns solid teal with "Complete" on success and red with "Failed" or
+"Cancelled" otherwise, and sweeps back and forth while a step (like YouTube's
+mp3 conversion) has no real percentage to report. **Cancel** stops the job
+immediately and deletes whatever partial output it had produced — a half-merged
+file, in-progress split segments, or a partially downloaded YouTube mp3.
+
+**Merge** — drop two or more mp3 parts of the same audiobook (in order, or drag
+within the list to reorder), then click **Merge**. A dialog asks for the output
+file name (pre-filled with `<first file>_merged`). Uses a fast stream copy; if
 the source files don't share the same format it automatically retries with a
-re-encode. Check "Then split into segments" before merging to automatically chop
-the merged result using the Split tool's current segment length — no manual
-hand-off needed.
+re-encode. **File as** files the result into the library (as an audiobook or
+music) or leaves it in the output folder; **Add to** optionally puts it on a
+playlist. Check "Then split into segments" to chop the merged result with the
+Split tool's current segment length — no manual hand-off needed.
 
-**Split module** — set the segment length in minutes (defaults to 2), then drop
-one or more mp3 files onto the drop zone — splitting starts immediately. Before it
-starts, Splice logs an estimated segment count per file (based on each file's
-probed duration); the same estimate follows along next to the current file while
-it processes. Each file gets its own `<filename>_split/` folder in the output
-location, containing `0.mp3`, `1.mp3`, `2.mp3`, etc. Splitting is a fast stream
-copy (no re-encoding), so segment boundaries can be off by up to ~1 second.
+**Split** — set the segment length in minutes (defaults to 2), then drop one or
+more mp3 files onto the drop zone — splitting starts immediately. Splice logs an
+estimated segment count per file first. Each file gets its own
+`<filename>_split/` folder in the output folder, containing `0.mp3`, `1.mp3`,
+`2.mp3`, etc. Splitting is a fast stream copy (no re-encoding), so segment
+boundaries can be off by up to ~1 second. When it finishes, **Send segments to
+Tags** opens Tags › Batch apply with the new segments already loaded.
 
-Once a split finishes, click "SEND SEGMENTS TO TAGS" to jump straight to Tags >
-Batch Apply with the new segments already loaded, ready to tag.
-
-**YouTube module** — paste one or more URLs (one per line — single videos or
-playlist links both work) and click ADD TO QUEUE. Playlist URLs are expanded into
+**YouTube** — paste one or more URLs (one per line — single videos or playlist
+links both work) and click **Add to queue**. Playlist URLs are expanded into
 their individual videos automatically. Everything downloads and converts to mp3
-(via `yt-dlp` + ffmpeg) straight into the output folder, one at a time, from a
-visible queue — you can keep pasting more (including while something's already
-downloading) and it just joins the back of the line. Already-queued or
-currently-downloading duplicates are skipped automatically. The YouTube tool runs
-fully independently of Merge/Split/Tags — none of them block each other. This only
-downloads — drag the result onto the Split zone yourself if you want it chunked.
+(via `yt-dlp` + ffmpeg) one at a time from a visible queue — keep pasting more
+while something's downloading and it joins the back of the line; duplicates
+are skipped. **Quality** sets the mp3 bitrate for what you add next (remembered
+between sessions), **File as** files downloads into the library as music or an
+audiobook (or leaves them in the output folder), and **Add to playlist** puts
+music straight onto a playlist. Queue items show the video's real title once
+it's looked up. Drag items to reorder, or use **Remove selected** / **Clear
+queue**; **Cancel** stops only the current download and the queue carries on.
+If you close Splice with downloads pending, it offers to resume them next time.
 
-Queue items show the video's real title (looked up in the background right after
-you add it — briefly shows the raw URL until that resolves). Drag items within the
-queue to reorder them, or use REMOVE SELECTED / CLEAR QUEUE to drop pending ones;
-CANCEL stops only the one currently downloading (the queue then continues with the
-next). The Quality dropdown next to ADD TO QUEUE controls the mp3 bitrate for
-whatever you add next (from a VBR "best" option down to 128 kbps for smaller
-files) and is remembered between sessions. If you close Splice with downloads
-still pending, it'll offer to resume that queue next time you launch.
+**Tags** — edit ID3 metadata like iTunes/an iPod would show it:
 
-**Tags module** — edit ID3 metadata like iTunes/an iPod would show it:
+- *Single file*: what **Fix tags** / **Edit tags** open — edit
+  title/artist/album/year/track number, choose a cover image, and save. Saving a
+  library track re-files it if the new tags change where it belongs.
+- *Batch apply*: what the Tags button opens (always empty, never leftovers from
+  last time). Add a group of files (e.g. all segments from one `_split/`
+  folder, or dragged in from the library), set shared artist/album/year/artwork,
+  and apply to all at once — track numbers are set automatically in list order
+  (1, 2, 3, ...). Title is left untouched so per-segment titles aren't
+  clobbered. Artist/Album/Year and the artwork are remembered between runs.
 
-- *Single file*: load one mp3, edit title/artist/album/year/track number, choose a
-  cover image, and save. Existing tags and artwork (if any) are shown when loaded.
-- *Batch apply*: add a group of files (e.g. all segments from one `_split/` folder,
-  or via SEND SEGMENTS TO TAGS above), set shared artist/album/year/artwork, and
-  apply to all at once — track numbers are set automatically in list order
-  (1, 2, 3, ...). Title is left untouched so distinct per-segment titles aren't
-  clobbered. Artist/Album/Year and the chosen artwork are remembered between runs
-  (handy when tagging a whole audiobook's segments across a couple of sittings).
+**Log** — the **Log** button in the top bar opens the log of everything Splice
+has done this session. Its dot is grey when idle, amber while working, teal when
+something finished and red on an error; background jobs (measuring loudness,
+checking artwork) show their progress on the button itself.
+
+## Project layout
+
+`splice.py` is a thin entry point — the app itself lives in the `splice/` package:
+
+- `splice/styles.py` — the Midnight palette, fonts (Righteous + Barlow, bundled
+  in `splice/assets/fonts/`, SIL Open Font License) and the app-wide Qt stylesheet
+- `splice/sidebar.py` — the sidebar: library sections, cleanup chips, playlists,
+  and the slot for the mini player
+- `splice/main_window.py` — the window shell (sidebar, top bar, tool drawer, log)
+  and the Merge/Split/YouTube/Tags tool behavior
+- `splice/library_view.py` — the Songs/Audiobooks/cleanup pages, the playlist and
+  audiobook series pages, the shared delete/selection/right-click helpers, and the
+  dialogs (Add sources, Add files, Export, duplicate review, track info)
+- `splice/widgets.py` — reusable widgets: the track table rows and column header,
+  progress meter, drop zones, artwork tiles, audiobook shelf, mini player, log button
+- `splice/workers.py` — background `QThread` workers that shell out to ffmpeg/ffprobe/yt-dlp
+- `splice/player.py` — in-app playback
+- `splice/tagging.py` — `mutagen`-based ID3 read/write helpers (no Qt dependency)
+- `splice/library/` — the library backend: `db.py` (SQLite index), `scanner.py`
+  (read-only tag/duration/hash reads), `naming.py` (destination paths),
+  `playlists.py` (`.m3u8` read/write), `migrate.py` (scan/build workers),
+  `export.py` (device-export worker), `loudness.py` and `health.py` (background
+  library checks), `series_artwork.py`
+- `tests/` — the pytest suite (see "Running the tests")
