@@ -4,3 +4,4 @@ __pycache__/
 /VISION.md
 /scratch_test/
 .venv/
+.pytest_cache/

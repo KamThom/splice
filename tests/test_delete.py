@@ -1,0 +1,86 @@
+"""Deleting from the library: songs, whole series, single books, cancel."""
+
+from pathlib import Path
+
+from PyQt6.QtWidgets import QMessageBox
+
+import splice.library_view as lv
+from splice.library import db as libdb
+from splice.library.series_artwork import find_series_artwork
+
+
+def _view(library):
+    view = lv.LibraryView(lambda: str(library.root), lambda r: None)
+    view.refresh()
+    return view
+
+
+def _select_title(list_widget, title):
+    list_widget.clearSelection()
+    for i in range(list_widget.count()):
+        if list_widget.item(i).data(256)["title"] == title:
+            list_widget.item(i).setSelected(True)
+
+
+def test_cancel_deletes_nothing(qtbot, library, answer_dialogs):
+    view = _view(library)
+    answer_dialogs["value"] = QMessageBox.StandardButton.No
+    _select_title(view.songs_list, "One")
+    view._remove_selected_tracks()
+    assert view.songs_list.count() == 3
+    assert (library.root / "Music/Band/LP/01 One.mp3").exists()
+
+
+def test_delete_song_updates_playlist_and_prunes_folders(qtbot, library, answer_dialogs):
+    view = _view(library)
+    _select_title(view.songs_list, "Three")
+    assert view.copy_actions.count_label.text() == "1 selected"
+    view._remove_selected_tracks()
+    assert not (library.root / "Music/Solo").exists()  # emptied artist/album folders removed
+    assert (library.root / "Music").exists()  # top-level folder kept
+    m3u = (library.root / "Playlists/Mix.m3u8").read_text()
+    assert "Three" not in m3u and "One" in m3u
+    assert view.songs_list.count() == 2
+
+
+def test_delete_series_removes_books_and_artwork(qtbot, library, answer_dialogs):
+    view = _view(library)
+    view._delete_series("Saga")
+    assert not (library.root / "Audiobooks/Saga").exists()
+    assert (library.root / "Audiobooks").exists()
+    assert find_series_artwork(str(library.root), "Saga") is None
+    conn = libdb.open_db(str(library.root))
+    assert not libdb.list_tracks_in_series(conn, "Saga")
+    conn.close()
+    assert view._counts["audiobooks"] == 3
+
+
+def test_delete_standalone_with_absolute_path(qtbot, library, answer_dialogs):
+    path = library.root / "Audiobooks/Lonely.mp3"
+    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["lonely"], str(path))], noun="audiobook")
+    assert n == 1 and not path.exists()
+
+
+def test_series_page_delete_last_book_goes_back(qtbot, library, answer_dialogs):
+    page = lv.AudiobookSeriesView(lambda: str(library.root))
+    back, changed = [], []
+    page.backRequested.connect(lambda: back.append(True))
+    page.libraryChanged.connect(lambda: changed.append(True))
+    page.show_series("Duo")
+    page.track_list.item(0).setSelected(True)
+    page._remove_selected()
+    assert page.track_list.count() == 1 and not back and changed
+    page.track_list.item(0).setSelected(True)
+    page._remove_selected()
+    assert back
+    assert not (library.root / "Audiobooks/Duo").exists()
+
+
+def test_locked_file_is_reported_not_deleted(qtbot, library, answer_dialogs, monkeypatch):
+    monkeypatch.setattr(lv, "_try_unlink", lambda path: "in use")
+    n = lv.delete_library_tracks(None, str(library.root), [(library.ids["one"], "Music/Band/LP/01 One.mp3")])
+    assert n == 0
+    assert answer_dialogs["messages"] and "couldn't be deleted" in answer_dialogs["messages"][0][0]
+    conn = libdb.open_db(str(library.root))
+    assert conn.execute("SELECT 1 FROM tracks WHERE id = ?", (library.ids["one"],)).fetchone()
+    conn.close()
